@@ -1,0 +1,68 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=$PATH:/usr/local/go/bin:/home/claude/go/bin:/home/claude/.local/bin
+ENV GOPATH=/home/claude/go
+
+ARG GO_VERSION=1.24.7
+ARG NODE_VERSION=20
+ARG GOLANGCI_VERSION=v1.64.8
+ARG GH_VERSION=2.80.0
+
+# ── All apt deps in one layer ──────────────────────────────────────────────────
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl wget git ca-certificates unzip \
+        jq vim less tree \
+        ripgrep fd-find fzf \
+        make build-essential pkg-config \
+        python3 python3-pip python3-venv \
+        dnsutils netcat-openbsd httpie \
+        procps lsof strace \
+    # Node.js
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    # gh CLI
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+       https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    # Cleanup
+    && rm -rf /var/lib/apt/lists/* \
+    # Symlinks
+    && ln -s $(which fdfind) /usr/local/bin/fd \
+    && ln -sf $(which batcat) /usr/local/bin/bat 2>/dev/null || true
+
+# ── Go + toolchain in one layer ────────────────────────────────────────────────
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+    && wget -q https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz \
+    && tar -C /usr/local -xzf go${GO_VERSION}.linux-${ARCH}.tar.gz \
+    && rm go${GO_VERSION}.linux-${ARCH}.tar.gz \
+    && go install github.com/go-delve/delve/cmd/dlv@latest \
+    && go install github.com/golangci/golangci-lint/cmd/golangci-lint@${GOLANGCI_VERSION} \
+    && go install golang.org/x/vuln/cmd/govulncheck@latest \
+    && go install honnef.co/go/tools/cmd/staticcheck@latest \
+    # Drop build deps no longer needed, clean caches
+    && apt-get purge -y --auto-remove build-essential pkg-config \
+    && go clean -cache -modcache \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Move root-installed tools to system-wide paths ───────────────────────────
+RUN cp /home/claude/go/bin/* /usr/local/bin/
+
+# ── Non-root user (required for --dangerously-skip-permissions) ──────────────
+RUN useradd -m -s /bin/bash claude \
+    && chown -R claude:claude /home/claude
+USER claude
+
+# ── Claude Code (install as claude user so it lands in ~claude/.local/bin) ───
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# ── Install GSD (Get Shit Done) ──────────────────────────────────────────────
+RUN npx get-shit-done-cc@latest --claude --global
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

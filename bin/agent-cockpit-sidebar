@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Sidebar display for agent-cockpit. Shows current working directory of each agent pane
+# with launch options (GoLand / VS Code / a popup terminal).
+# Usage: agent-cockpit-sidebar SESSION
+
+SESSION="${1:?Usage: agent-cockpit-sidebar SESSION}"
+STATE_DIR="/tmp/${SESSION}"
+
+# ── State ──
+SLOT_OPTIONS=("GoLand" "VS Code" "Terminal")   # launch options under each agent
+CURSOR=0             # 0 .. 4 × options - 1
+RENDER_NEEDED=1
+TAIL_PID=""
+ORIG_STTY=""
+
+# Display paths (~/...) and absolute paths for IDE launch
+CWDS=()
+RAW_CWDS=()
+NOTIFS=()
+NOTIF_MSGS=()
+
+# Focus-aware notification clearing state
+AGENT_PANES=()         # cached pane IDs (read once at startup)
+PREV_NOTIFS=()         # previous render's notif values
+PREV_FOCUSED=()        # previous render's focus state per slot (0/1)
+NOTIF_EXPIRE_AT=()     # $SECONDS when notif should auto-expire (0 = no timer)
+
+# Usage limits block (AC_USAGE=claude[,codex]). Rows come from the per-harness cache files
+# that agent-cockpit-usage-write maintains, so nothing here is harness-specific.
+USAGE_HARNESSES=()     # enabled harnesses, in AC_USAGE order
+USAGE_CONTENT=()       # cache file contents per harness ("" = no data yet)
+USAGE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-cockpit/usage"
+USAGE_SIG=""           # data + current minute, to re-render only when the block changes
+USAGE_NEXT_POLL=0      # $SECONDS of the next cache read
+CODEX_NEXT_REFRESH=0   # $SECONDS of the next Codex log scan
+USAGE_PARTIALS=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
+DATE_KEYS=()           # resets_at → "Fri 20:00" cache (formatting forks date)
+DATE_VALS=()
+INT_RE='^[0-9]+$'
+# Wall clock without forking date: bash's SECONDS is wall-clock based, so it stays
+# correct across sleep/wake
+START_EPOCH=$(( $(date +%s) - SECONDS ))
+
+# ── Terminal setup / cleanup ──
+
+apply_raw_mode() {
+    stty -echo -icanon min 0 time 2 2>/dev/null
+}
+
+drain_input() {
+    # Flush stale bytes from stdin (e.g. after sleep/wake)
+    stty min 0 time 0 2>/dev/null
+    while [[ -n "$(dd bs=1 count=1 2>/dev/null)" ]]; do :; done
+    apply_raw_mode
+}
+
+setup_term() {
+    ORIG_STTY=$(stty -g)
+    apply_raw_mode
+    # Hide cursor, disable auto-wrap (DECAWM off) so full-width lines don't double-break
+    printf '\033[?25l'
+    printf '\033[?7l'
+}
+
+cleanup() {
+    # Restore terminal
+    if [[ -n "$ORIG_STTY" ]]; then
+        stty "$ORIG_STTY" 2>/dev/null
+    fi
+    # Re-enable auto-wrap, show cursor
+    printf '\033[?7h' 2>/dev/null
+    printf '\033[?25h' 2>/dev/null
+    # Kill background tail
+    if [[ -n "$TAIL_PID" ]] && kill -0 "$TAIL_PID" 2>/dev/null; then
+        kill "$TAIL_PID" 2>/dev/null
+        wait "$TAIL_PID" 2>/dev/null
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+handle_resume() {
+    apply_raw_mode
+    drain_input
+    printf '\033[?25l'
+    printf '\033[?7l'
+    # Restart watcher if it died during sleep
+    if [[ -n "$TAIL_PID" ]] && ! kill -0 "$TAIL_PID" 2>/dev/null; then
+        start_notify_watcher
+    fi
+    RENDER_NEEDED=1
+}
+
+# ── Path helpers ──
+
+short_path() {
+    local path="$1"
+    [[ -z "$path" || "$path" == "—" ]] && { printf '%s' "$path"; return; }
+
+    local last="${path##*/}"
+    # If no slash or path equals last segment (root-level like /Users, or ~)
+    if [[ "$path" == "$last" || "$path" == "/$last" ]]; then
+        printf '%s' "$path"
+    else
+        printf '.../%s' "$last"
+    fi
+}
+
+read_cwds() {
+    local i
+    for i in 1 2 3 4; do
+        RAW_CWDS[$i]=$(cat "$STATE_DIR/slot$i" 2>/dev/null) || RAW_CWDS[$i]=""
+        CWDS[$i]="${RAW_CWDS[$i]/#$HOME/~}"
+        # If empty, show dash
+        [[ -z "${CWDS[$i]}" ]] && CWDS[$i]="—"
+    done
+}
+
+read_notifs() {
+    local i
+    local active_pane
+    active_pane=$(tmux display-message -t "$SESSION" -p '#{pane_id}' 2>/dev/null) || active_pane=""
+
+    for i in 1 2 3 4; do
+        NOTIFS[$i]=$(cat "$STATE_DIR/notif$i" 2>/dev/null) || NOTIFS[$i]=""
+
+        # Determine if this slot's pane is currently focused
+        local is_focused=0
+        if [[ "$active_pane" == "${AGENT_PANES[$i]:-}" ]]; then
+            is_focused=1
+        fi
+
+        if [[ -n "${NOTIFS[$i]}" ]] && (( is_focused )); then
+            if [[ -z "${PREV_NOTIFS[$i]:-}" ]]; then
+                # Notif is NEW (wasn't present last render) while pane is focused
+                # → arrived while user was already here → 5-second auto-expire
+                NOTIF_EXPIRE_AT[$i]=$(( SECONDS + 5 ))
+            elif (( ${PREV_FOCUSED[$i]:-0} == 0 )); then
+                # Notif existed but pane just got focused → user switched here → clear now
+                : > "$STATE_DIR/notif$i"
+                : > "$STATE_DIR/notif_msg$i"
+                NOTIFS[$i]=""
+                NOTIF_MSGS[$i]=""
+                NOTIF_EXPIRE_AT[$i]=0
+            else
+                # Both notif and focus existed last render → check timer
+                if (( ${NOTIF_EXPIRE_AT[$i]:-0} > 0 && SECONDS >= ${NOTIF_EXPIRE_AT[$i]} )); then
+                    : > "$STATE_DIR/notif$i"
+                    : > "$STATE_DIR/notif_msg$i"
+                    NOTIFS[$i]=""
+                    NOTIF_MSGS[$i]=""
+                    NOTIF_EXPIRE_AT[$i]=0
+                fi
+            fi
+        else
+            NOTIF_EXPIRE_AT[$i]=0
+        fi
+
+        PREV_NOTIFS[$i]="${NOTIFS[$i]}"
+        PREV_FOCUSED[$i]=$is_focused
+    done
+}
+
+read_notif_msgs() {
+    local i
+    for i in 1 2 3 4; do
+        NOTIF_MSGS[$i]=$(cat "$STATE_DIR/notif_msg$i" 2>/dev/null) || NOTIF_MSGS[$i]=""
+    done
+}
+
+notif_label() {
+    case "$1" in
+        done)     printf '\033[1;32m◉ Done\033[0m' ;;
+        question) printf '\033[1;33m◉ Needs input\033[0m' ;;
+    esac
+}
+
+# ── Usage limits ──
+
+parse_usage_config() {
+    local list="${AC_USAGE:-}" h seen=","
+    list="${list//[^a-z,]/}"
+    local IFS=,
+    for h in $list; do
+        case "$h" in
+            claude|codex) ;;
+            *) continue ;;
+        esac
+        [[ "$seen" == *",$h,"* ]] && continue
+        seen="$seen$h,"
+        USAGE_HARNESSES+=("$h")
+    done
+}
+
+# Re-read the cache files and request a render when the data or the current minute
+# changed (countdowns and ages are shown at minute resolution). Codex has no hook to
+# push data, so its log reader is started from here, in the background.
+poll_usage() {
+    local i h file sig=""
+    for (( i = 0; i < ${#USAGE_HARNESSES[@]}; i++ )); do
+        h="${USAGE_HARNESSES[$i]}"
+        if [[ "$h" == "codex" ]] && (( SECONDS >= CODEX_NEXT_REFRESH )); then
+            CODEX_NEXT_REFRESH=$(( SECONDS + 30 ))
+            agent-cockpit-usage-codex >/dev/null 2>&1 &
+        fi
+        file="$USAGE_CACHE_DIR/$h.tsv"
+        USAGE_CONTENT[$i]=""
+        [[ -f "$file" ]] && USAGE_CONTENT[$i]=$(<"$file")
+        sig="$sig$h:${USAGE_CONTENT[$i]}|"
+    done
+    sig="$sig$(( (START_EPOCH + SECONDS) / 60 ))"
+    if [[ "$sig" != "$USAGE_SIG" ]]; then
+        USAGE_SIG="$sig"
+        RENDER_NEEDED=1
+    fi
+}
+
+# Time until a window resets → REPLY ("42m", "1h07m", "Fri 20:00", "reset")
+fmt_reset() {
+    local reset="$1" now="$2" d i mm
+    d=$(( reset - now ))
+    if (( d <= 0 )); then
+        REPLY="reset"
+    elif (( d < 60 )); then
+        REPLY="<1m"
+    elif (( d < 3600 )); then
+        REPLY="$(( d / 60 ))m"
+    elif (( d < 86400 )); then
+        mm=$(( d % 3600 / 60 ))
+        (( mm < 10 )) && mm="0$mm"
+        REPLY="$(( d / 3600 ))h${mm}m"
+    else
+        for (( i = 0; i < ${#DATE_KEYS[@]}; i++ )); do
+            if [[ "${DATE_KEYS[$i]}" == "$reset" ]]; then
+                REPLY="${DATE_VALS[$i]}"
+                return
+            fi
+        done
+        # BSD date, then GNU date
+        REPLY=$(date -r "$reset" '+%a %H:%M' 2>/dev/null || date -d "@$reset" '+%a %H:%M' 2>/dev/null) || REPLY="?"
+        DATE_KEYS+=("$reset")
+        DATE_VALS+=("$REPLY")
+    fi
+}
+
+# Age of the newest report → REPLY ("now", "4m ago", "3h ago", "2d ago")
+fmt_age() {
+    local a=$(( $2 - $1 ))
+    if (( a < 60 )); then
+        REPLY="now"
+    elif (( a < 3600 )); then
+        REPLY="$(( a / 60 ))m ago"
+    elif (( a < 86400 )); then
+        REPLY="$(( a / 3600 ))h ago"
+    else
+        REPLY="$(( a / 86400 ))d ago"
+    fi
+}
+
+# Bar of $2 cells filled to pct $1 in color $3, empty cells in color $4 → REPLY
+usage_bar() {
+    local pct="$1" cells="$2" color="$3" dim="$4" r='\033[0m'
+    local eighths full part empty i bar=""
+    eighths=$(( pct * cells * 8 / 100 ))
+    (( eighths > cells * 8 )) && eighths=$(( cells * 8 ))
+    full=$(( eighths / 8 ))
+    part=$(( eighths % 8 ))
+    empty=$(( cells - full - (part ? 1 : 0) ))
+    for (( i = 0; i < full; i++ )); do bar="${bar}█"; done
+    (( part )) && bar="$bar${USAGE_PARTIALS[$part]}"
+    bar="$color$bar$r$dim"
+    for (( i = 0; i < empty; i++ )); do bar="${bar}░"; done
+    REPLY="$bar$r"
+}
+
+# Bottom block: per harness a header separator (name · age), then a bar line and a reset
+# line per window. A harness that doesn't fit in $2 rows is left out, with every one after
+# it — the bottom border must stay visible and nothing may print past the last row.
+render_usage() {
+    local width="$1" rows_left="$2" dashes="$3"
+    local g='\033[1;38;2;217;119;87m' w='\033[1;37m' dg='\033[2;38;2;193;95;60m' r='\033[0m'
+    local yellow='\033[1;33m' red='\033[1;31m'
+    local now=$(( START_EPOCH + SECONDS ))
+    local i h content label pct reset reported n newest need text fill cells color msg
+
+    for (( i = 0; i < ${#USAGE_HARNESSES[@]}; i++ )); do
+        h="${USAGE_HARNESSES[$i]}"
+        content="${USAGE_CONTENT[$i]:-}"
+
+        n=0
+        newest=0
+        while IFS=$'\t' read -r label pct reset reported; do
+            [[ -n "$label" && "$pct" =~ $INT_RE && "$reset" =~ $INT_RE && "$reported" =~ $INT_RE ]] || continue
+            n=$(( n + 1 ))
+            (( reported > newest )) && newest=$reported
+        done <<< "$content"
+
+        need=$(( 1 + (n ? 2 * n : 1) ))
+        (( need <= rows_left )) || return 0
+        rows_left=$(( rows_left - need ))
+
+        # Header separator: ├─ claude · 2m ago ───┤  (age dropped, then name, when narrow)
+        text="$h"
+        if (( n )); then
+            fmt_age "$newest" "$now"
+            text="$h · $REPLY"
+        fi
+        (( ${#text} + 5 > width )) && text="$h"
+        fill=$(( width - 5 - ${#text} ))
+        if (( fill < 0 )); then
+            fill=$(( width - 2 ))
+            (( fill < 0 )) && fill=0
+            printf '%b├%s┤%b\n' "$w" "${dashes:0:$fill}" "$r"
+        else
+            printf '%b├─ %b%s%b%s%b %s┤%b\n' "$w" "$g" "$h" "$dg" "${text:${#h}}" "$w" "${dashes:0:$fill}" "$r"
+        fi
+
+        if (( n == 0 )); then
+            # Claude data only flows once install.sh has wrapped the statusLine
+            case "$h" in
+                claude) msg="no data · run ./install.sh" ;;
+                *)      msg="no data yet" ;;
+            esac
+            (( ${#msg} + 2 > width )) && msg="no data"
+            printf ' %b%s%b\n' "$dg" "$msg" "$r"
+            continue
+        fi
+
+        cells=$(( width - 11 ))
+        (( cells > 10 )) && cells=10
+        while IFS=$'\t' read -r label pct reset reported; do
+            [[ -n "$label" && "$pct" =~ $INT_RE && "$reset" =~ $INT_RE && "$reported" =~ $INT_RE ]] || continue
+            # Past its reset the window has rolled over; without newer data it reads as 0%
+            (( reset <= now )) && pct=0
+            (( pct > 100 )) && pct=100
+            if (( pct >= 80 )); then
+                color="$red"
+            elif (( pct >= 50 )); then
+                color="$yellow"
+            else
+                color="$g"
+            fi
+            if (( cells >= 4 )); then
+                usage_bar "$pct" "$cells" "$color" "$dg"
+                printf ' %b%-4s%b %b %b%3d%%%b\n' "$w" "$label" "$r" "$REPLY" "$color" "$pct" "$r"
+            else
+                printf ' %b%-4s%b %b%3d%%%b\n' "$w" "$label" "$r" "$color" "$pct" "$r"
+            fi
+            fmt_reset "$reset" "$now"
+            printf '      %b↻ %s%b\n' "$dg" "$REPLY" "$r"
+        done <<< "$content"
+    done
+}
+
+# ── Rendering ──
+
+render() {
+    read_cwds
+    read_notifs
+    read_notif_msgs
+    # stty reads the pane size from the tty on stdin. tput can't be used here: with its
+    # stdout captured and stderr silenced it sees no terminal and reports 80x24.
+    local size width=30 height=0
+    size=$(stty size 2>/dev/null) || size=""
+    if [[ "$size" =~ ^[0-9]+\ [0-9]+$ ]]; then
+        height="${size% *}"
+        width="${size#* }"
+    fi
+
+    tput cup 0 0
+    tput ed
+
+    render_interactive "$width" "$height"
+
+    RENDER_NEEDED=0
+}
+
+render_interactive() {
+    local width="$1" height="$2"
+    local idx=0 opt
+
+    # Colors — Claude orange accent + white text
+    local g='\033[1;38;2;217;119;87m'       # bright Claude orange (slot numbers)
+    local w='\033[1;37m'                    # bold white (paths)
+    local sel='\033[1;37;7m'                # bold white inverse (selected IDE)
+    local dg='\033[2;38;2;193;95;60m'       # dim rust orange (unselected, borders)
+    local r='\033[0m'                       # reset
+
+    # Precompute dash string of $width '─' chars
+    local dashes
+    printf -v dashes '%*s' "$width" ''
+    dashes="${dashes// /─}"
+
+    # Border fills (clamped to 0 for narrow terminals)
+    local sep_fill=$(( width - 2 ))
+    (( sep_fill < 0 )) && sep_fill=0
+    local bot_fill=$(( width - 21 ))
+    (( bot_fill < 0 )) && bot_fill=0
+
+    # Empty line (visual spacer)
+    printf '\n'
+
+    for i in 1 2 3 4; do
+        # Agent header
+        printf '  %b[%d]%b %b▸%b %b%s%b\n' "$g" "$i" "$r" "$dg" "$r" "$w" "$(short_path "${CWDS[$i]}")" "$r"
+
+        # Launch options
+        for opt in "${SLOT_OPTIONS[@]}"; do
+            if (( idx == CURSOR )); then
+                printf '      %b ◆ %s %b\n' "$sel" "$opt" "$r"
+            else
+                printf '      %b◇ %s%b\n' "$dg" "$opt" "$r"
+            fi
+            (( idx++ ))
+        done
+
+        # 3-row notification area (label, context message, blank)
+        if [[ -n "${NOTIFS[$i]}" ]]; then
+            printf '      %b\n' "$(notif_label "${NOTIFS[$i]}")"
+            if [[ "${NOTIFS[$i]}" == "question" && -n "${NOTIF_MSGS[$i]:-}" ]]; then
+                local msg="${NOTIF_MSGS[$i]}"
+                local max_len=$(( width - 8 ))
+                (( max_len < 10 )) && max_len=10
+                if (( ${#msg} > max_len )); then
+                    msg="${msg:0:$(( max_len - 1 ))}…"
+                fi
+                printf '      \033[33m%s\033[0m\n' "$msg"
+            else
+                printf '\n'
+            fi
+        else
+            printf '\n'
+            printf '\n'
+        fi
+        printf '\n'
+
+        # Separator between agents / bottom border after last
+        if (( i < 4 )); then
+            printf '%b├%s┤%b\n' "$w" "${dashes:0:$sep_fill}" "$r"
+        fi
+    done
+
+    # Usage block in the rows left over: the agents above take 32, the bottom border 1
+    if (( ${#USAGE_HARNESSES[@]} )); then
+        render_usage "$width" $(( height - 33 )) "$dashes"
+    fi
+
+    # Bottom border. No trailing newline: on the last row it would scroll the screen.
+    printf '%b└── ↑↓ nav · ↵ open %s┘%b' "$w" "${dashes:0:$bot_fill}" "$r"
+}
+
+# ── Keyboard input ──
+
+# Read exactly 1 byte via dd (direct read(2) syscall).
+# Avoids bash 3.2 read -n terminal manipulation that corrupts stty settings.
+# Timeout inherited from stty min 0 time 2. Sets global BYTE.
+BYTE=""
+read_one_byte() {
+    BYTE=$(dd bs=1 count=1 2>/dev/null; printf .)
+    BYTE="${BYTE%.}"
+}
+
+# Sets global KEY variable: UP, DOWN, ENTER, ESCAPE, or empty (timeout)
+read_key() {
+    KEY=""
+    read_one_byte
+
+    if [[ -z "$BYTE" ]]; then
+        # Timeout — no input
+        return
+    fi
+
+    # Enter (CR or NL)
+    if [[ "$BYTE" == $'\r' || "$BYTE" == $'\n' ]]; then
+        KEY="ENTER"
+        return
+    fi
+
+    # ESC — could be standalone Escape or start of a sequence
+    if [[ "$BYTE" == $'\033' ]]; then
+        read_one_byte
+        if [[ -z "$BYTE" ]]; then
+            # No follow-up within 200ms → standalone Escape
+            KEY="ESCAPE"
+            return
+        fi
+        if [[ "$BYTE" == "[" ]]; then
+            read_one_byte
+            case "$BYTE" in
+                A) KEY="UP" ;;
+                B) KEY="DOWN" ;;
+                # Drain SGR mouse sequences (ESC [ < Cb;Cx;Cy M/m)
+                \<)
+                    while read_one_byte; [[ -n "$BYTE" ]]; do
+                        [[ "$BYTE" == "M" || "$BYTE" == "m" ]] && break
+                    done
+                    ;;
+                # Drain legacy mouse (ESC [ M + 3 raw bytes)
+                M) read_one_byte; read_one_byte; read_one_byte ;;
+            esac
+        fi
+        return
+    fi
+}
+
+# ── IDE launcher ──
+
+# Locate an IDE's .app bundle. Toolbox installs under ~/Applications, direct
+# downloads under /Applications. Falls back to the bare name so LaunchServices
+# can resolve an install in neither place. Resolved per keypress, not at
+# startup, so an IDE installed after the cockpit booted is still found.
+resolve_app() {
+    local override="$1" name="$2" candidate
+    if [[ -n "$override" ]]; then
+        printf '%s' "$override"
+        return
+    fi
+    for candidate in "$HOME/Applications/$name.app" "/Applications/$name.app"; do
+        [[ -d "$candidate" ]] && { printf '%s' "$candidate"; return; }
+    done
+    printf '%s' "$name"
+}
+
+# Usage: open_ide SLOT IDE  (IDE = "GoLand" or "VS Code")
+open_ide() {
+    local slot="$1" ide="$2"
+    local path="${RAW_CWDS[$slot]}"
+
+    [[ -z "$path" || ! -d "$path" ]] && return
+
+    local app
+    if [[ "$ide" == "GoLand" ]]; then
+        app=$(resolve_app "${AC_GOLAND_APP:-}" "GoLand")
+    else
+        app=$(resolve_app "${AC_VSCODE_APP:-}" "Visual Studio Code")
+    fi
+
+    # `open -a <bundle> <dir>` goes through LaunchServices, which hands the path
+    # to an already-running IDE. The `goland`/`code` shims are avoided: they may
+    # be absent from PATH, and the JetBrains Toolbox shim wraps `open -na`, which
+    # forces a throwaway second instance whose hand-off trips a "must be called
+    # on EDT" assert in the IDE and opens nothing.
+    #
+    # Output goes to a log rather than /dev/null so a failure leaves a trace;
+    # writing to stdout would corrupt the TUI.
+    {
+        printf '[%s] open -a %s -- %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$app" "$path"
+        open -a "$app" "$path" || printf '  FAILED (exit %d)\n' "$?"
+    } >>"$STATE_DIR/ide.log" 2>&1 &
+    disown 2>/dev/null
+}
+
+# ── Terminal popup ──
+
+# Each slot's terminal is a shell in a hidden session, _<session>-t<slot>, shown in a popup
+# over the whole layout. Closing the popup (`hide` in it, or prefix d) only detaches it, so
+# the shell, its scrollback and running jobs survive; `exit` ends it, and the next open starts
+# a new one in the slot's folder. agent-cockpit kill/prune remove these sessions by the same
+# name. AC_TERMINAL marks the shell so shell/init.sh defines `hide` there and nowhere else.
+# Usage: open_terminal SLOT
+open_terminal() {
+    local slot="$1"
+    local name="_${SESSION}-t${slot}"
+    local dir path title
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        # Already there: it stays wherever its shell is, the title shows that folder
+        path=$(tmux display-message -p -t "=$name:" '#{pane_current_path}' 2>/dev/null) || path=""
+    else
+        dir="${RAW_CWDS[$slot]}"
+        [[ -n "$dir" && -d "$dir" ]] || dir="$HOME"
+        # Options pinned on the session so a global config can't break it: destroy-unattached
+        # would kill it once the popup closes, detach-on-destroy off would land the popup in
+        # the cockpit session on `exit`
+        tmux new-session -d -s "$name" -c "$dir" -e AC_TERMINAL=1 \; \
+            set-option -t "=$name:" destroy-unattached off \; \
+            set-option -t "=$name:" detach-on-destroy on \; \
+            set-option -t "=$name:" status off \; \
+            set-option -t "=$name:" mouse on >>"$STATE_DIR/term.log" 2>&1 || return
+        # The new shell may not report its folder yet
+        path="$dir"
+    fi
+
+    title=" Agent $slot · $(short_path "${path/#$HOME/~}") · type hide to hide · exit to close "
+
+    # display-popup blocks until the popup closes, so it runs in the background; it finds
+    # the client through this pane's TMUX_PANE. The title is a format (# escaped) and the
+    # command runs in the user's default-shell, where zsh would expand an unquoted =name.
+    {
+        tmux display-popup -E -w 85% -h 85% -b rounded -S 'fg=#d97757' \
+            -T "${title//[#]/##}" "tmux attach-session -t '=$name'" \
+            || printf '[%s] popup for %s failed (exit %d)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$?"
+    } </dev/null >>"$STATE_DIR/term.log" 2>&1 &
+    disown 2>/dev/null
+}
+
+# ── Input handlers ──
+
+handle_interactive_input() {
+    case "$KEY" in
+        UP)
+            (( CURSOR > 0 )) && (( CURSOR-- ))
+            RENDER_NEEDED=1
+            ;;
+        DOWN)
+            (( CURSOR < 4 * ${#SLOT_OPTIONS[@]} - 1 )) && (( CURSOR++ ))
+            RENDER_NEEDED=1
+            ;;
+        ENTER)
+            local slot opt
+            slot=$(( CURSOR / ${#SLOT_OPTIONS[@]} + 1 ))
+            opt="${SLOT_OPTIONS[$(( CURSOR % ${#SLOT_OPTIONS[@]} ))]}"
+            if [[ "$opt" == "Terminal" ]]; then
+                open_terminal "$slot"
+            else
+                open_ide "$slot" "$opt"
+            fi
+            ;;
+    esac
+}
+
+# ── Notify watcher (background tail -f → SIGUSR1) ──
+
+start_notify_watcher() {
+    local main_pid=$$
+    (
+        tail -n 0 -f "$STATE_DIR/notify" 2>/dev/null | while read -r _; do
+            kill -USR1 "$main_pid" 2>/dev/null || exit
+        done
+    ) &
+    TAIL_PID=$!
+}
+
+# ── Main loop ──
+
+cache_pane_ids() {
+    local i
+    for i in 1 2 3 4; do
+        AGENT_PANES[$i]=$(tmux show-environment -t "$SESSION" "AGENT_PANE_$i" 2>/dev/null | cut -d= -f2) || AGENT_PANES[$i]=""
+    done
+}
+
+main_loop() {
+    cache_pane_ids
+    setup_term
+
+    trap 'RENDER_NEEDED=1' USR1
+    trap 'RENDER_NEEDED=1' WINCH
+    trap handle_resume CONT
+
+    start_notify_watcher
+
+    parse_usage_config
+    if (( ${#USAGE_HARNESSES[@]} )); then
+        poll_usage
+    fi
+
+    local loop_count=0
+    while true; do
+        if (( RENDER_NEEDED )); then
+            render
+        fi
+
+        read_key
+
+        if [[ -n "$KEY" ]]; then
+            handle_interactive_input
+        fi
+
+        # Usage cache read every ~5s (scheduled on SECONDS, not loop ticks: keypresses
+        # and renders make ticks irregular)
+        if (( ${#USAGE_HARNESSES[@]} && SECONDS >= USAGE_NEXT_POLL )); then
+            USAGE_NEXT_POLL=$(( SECONDS + 5 ))
+            poll_usage
+        fi
+
+        # Clear notification if its pane is now focused (backup for tmux hooks)
+        # Only queries tmux when notifications are active; only re-renders on actual change
+        for i in 1 2 3 4; do
+            if [[ -n "${NOTIFS[$i]:-}" ]]; then
+                local check_pane
+                check_pane=$(tmux display-message -t "$SESSION" -p '#{pane_id}' 2>/dev/null) || break
+                for j in 1 2 3 4; do
+                    if [[ -n "${NOTIFS[$j]:-}" ]]; then
+                        if [[ "$check_pane" == "${AGENT_PANES[$j]:-}" ]]; then
+                            : > "$STATE_DIR/notif$j"
+                            : > "$STATE_DIR/notif_msg$j"
+                            NOTIFS[$j]=""
+                            NOTIF_MSGS[$j]=""
+                            NOTIF_EXPIRE_AT[$j]=0
+                            PREV_NOTIFS[$j]=""
+                            PREV_FOCUSED[$j]=1
+                            RENDER_NEEDED=1
+                        fi
+                    fi
+                done
+                break
+            fi
+        done
+
+        # Keep rendering while any auto-expire timer is active
+        for i in 1 2 3 4; do
+            if (( ${NOTIF_EXPIRE_AT[$i]:-0} > 0 )); then
+                RENDER_NEEDED=1
+                break
+            fi
+        done
+
+        # Safety net: re-apply raw mode every ~30s (150 × 200ms)
+        (( loop_count++ ))
+        if (( loop_count >= 150 )); then
+            apply_raw_mode
+            loop_count=0
+
+            # Exit if session was destroyed (safety net for missed signals)
+            if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+                exit 0
+            fi
+        fi
+    done
+}
+
+main_loop

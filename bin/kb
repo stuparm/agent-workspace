@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kb — Personal Knowledge Base helper (project-agnostic).
+# Resolves the target KB via $KB_PATH. Concurrency-safe via mkdir-based locks.
+
+usage() {
+  cat <<'EOF'
+kb — Personal Knowledge Base helper
+
+Usage:
+  kb init [path]                Scaffold a new KB (uses $KB_PATH if no arg).
+  kb path                       Print resolved $KB_PATH.
+  kb note <slug>                Create inbox/<session>-<ts>-<slug>.md.
+  kb meeting <topic>            Create meetings/<YYYY-MM-DD-HH-MM>-<topic>.md.
+  kb log <kind> <title...>      Append a line to log.md (flocked).
+  kb memory add <type> <name>   Create memory/<type>_<name>.md and add MEMORY.md pointer.
+  kb memory list                List memory entries.
+  kb inbox                      List inbox entries chronologically.
+  kb decision <slug>            Create decisions/<date>-<slug>.md (ADR-lite).
+  kb digest <slug>              Create sessions/<date>-<repo>-<slug>.md.
+  kb repo [dir]                 Print "<repo><TAB><branch>" for dir (worktree -> main repo).
+  kb queue {add|remove|bump|list|count|clear}
+                                Pending session digests (fed by a SessionEnd hook).
+  kb sessions prune [days]      Move digests older than <days> (default 14) out of
+                                sessions/ into sessions-archive/, so sessions/ holds
+                                only a recent window.
+  kb sync                       pull --rebase, commit all, push to origin.
+  kb lint                       Regenerate index.md from wiki/, meetings/, memory/, decisions/.
+  kb --help, -h                 Show this help.
+
+Environment:
+  KB_PATH                       Absolute path to the active KB (required for all
+                                commands except `kb init <path>`).
+EOF
+}
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+_kb_resolve_path() {
+  if [[ -z "${KB_PATH:-}" ]]; then
+    echo "kb: KB_PATH not set. Export KB_PATH or run 'kb init <path>'." >&2
+    return 1
+  fi
+  if [[ ! -d "$KB_PATH" ]]; then
+    echo "kb: KB_PATH does not exist: $KB_PATH" >&2
+    echo "kb: run 'kb init' to scaffold it." >&2
+    return 1
+  fi
+  echo "$KB_PATH"
+}
+
+_kb_session() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    printf '%s\n' "${TMUX_PANE//[^a-zA-Z0-9]/}"
+  else
+    printf '%s-%s\n' "$(hostname -s)" "$$"
+  fi
+}
+
+_kb_slug() {
+  printf '%s\n' "$1" \
+    | tr '[:upper:] _' '[:lower:]--' \
+    | sed -E 's/[^a-z0-9-]//g; s/-+/-/g; s/^-//; s/-$//'
+}
+
+# Print "<repo>\t<branch>" for a directory. basename($dir) is wrong for
+# worktrees: myrepo-wt/<branch> would name a digest after the branch.
+# --git-common-dir points at the MAIN repo's .git from a worktree and at the
+# local .git otherwise, so its parent is the real repo in both cases. Branch is
+# empty outside git. This is the single source of truth for `kb digest` and any
+# script that names sessions/*.md (use `kb repo`), so they name them identically.
+_kb_repo_branch() {
+  local dir="${1:-$PWD}" common repo branch=""
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null || true)
+  if [[ -n "$common" ]]; then
+    [[ "$common" != /* ]] && common="$dir/$common"
+    repo=$(basename "$(cd "$(dirname "$common")" && pwd -P)")
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  else
+    repo=$(basename "$dir")
+  fi
+  printf '%s\t%s\n' "$repo" "$branch"
+}
+
+cmd_repo() { _kb_repo_branch "${1:-$PWD}"; }
+
+# Open a file in $EDITOR if stdin is a tty; otherwise no-op.
+# Agents (Claude's Bash tool) get just the path; humans in a terminal get the editor.
+# Word-splits EDITOR so values like `code --wait` work.
+_kb_open() {
+  local file="$1"
+  [[ -t 0 ]] || return 0
+  local cmd="${VISUAL:-${EDITOR:-vi}}"
+  local -a parts=()
+  read -r -a parts <<< "$cmd"
+  "${parts[@]}" "$file"
+}
+
+_kb_lock() {
+  local kb="$1" name="$2" timeout_ds=100 elapsed=0
+  local lock_dir="$kb/.locks/$name.d"
+  mkdir -p "$kb/.locks"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    sleep 0.1
+    elapsed=$((elapsed + 1))
+    if (( elapsed > timeout_ds )); then
+      echo "kb: lock timeout on $name (held by another process)" >&2
+      return 1
+    fi
+  done
+}
+
+_kb_unlock() {
+  local kb="$1" name="$2"
+  rmdir "$kb/.locks/$name.d" 2>/dev/null || true
+}
+
+_kb_with_lock() {
+  local kb="$1" name="$2"; shift 2
+  _kb_lock "$kb" "$name" || return 1
+  local rc=0
+  "$@" || rc=$?
+  _kb_unlock "$kb" "$name"
+  return $rc
+}
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+cmd_init() {
+  local target="${1:-${KB_PATH:-}}"
+  if [[ -z "$target" ]]; then
+    echo "kb init: provide a path or export KB_PATH first" >&2
+    return 1
+  fi
+  if [[ -e "$target" && -n "$(ls -A "$target" 2>/dev/null || true)" ]]; then
+    echo "kb init: $target already exists and is non-empty — refusing to overwrite" >&2
+    return 1
+  fi
+
+  mkdir -p "$target"/{memory,wiki,meetings,inbox,raw,.locks}
+  : > "$target/log.md"
+  : > "$target/index.md"
+
+  cat > "$target/MEMORY.md" <<'EOF'
+# MEMORY — KB Index
+
+This file is auto-loaded into every Claude session (via ~/.claude/CLAUDE.md).
+Keep it under ~200 lines. One pointer per entry, ≤150 chars.
+
+Format: `- [Title](memory/<type>_<name>.md) — one-line hook`
+
+Updates go through `kb memory add` (flocked). Do NOT edit this file directly
+from concurrent sessions with Edit/Write — use the helper.
+
+## User
+
+## Feedback
+
+## Project
+
+## Reference
+EOF
+
+  cat > "$target/CLAUDE.md" <<'EOF'
+# Knowledge Base — Schema for Agents
+
+Personal "second brain" — plain markdown, local git only, no remote.
+
+## Layout
+
+- `MEMORY.md` — index of memory pointers. Auto-loaded into every Claude session.
+- `memory/` — typed entries (user / feedback / project / reference). One file each.
+- `wiki/` — topic pages: architecture, packages, debugging recipes, conventions.
+- `meetings/` — meeting minutes. `YYYY-MM-DD-<topic>.md`.
+- `inbox/` — staging area for ad-hoc captures. `<session>-<ts>-<slug>.md`.
+- `raw/` — sources (articles, transcripts, screenshots). Read; do not modify.
+- `log.md` — append-only chronological event log.
+- `index.md` — auto-generated catalog. Regenerate via `kb lint`.
+
+## How to use
+
+1. Each task: read MEMORY.md (auto-loaded), browse relevant `wiki/` pages.
+2. Capture insights with `kb note <slug>` (goes to `inbox/`).
+3. User prefs / project context / references: `kb memory add <type> <name>`.
+4. Meetings: `kb meeting <topic>`.
+5. Notable events: `kb log <kind> <title>`.
+6. Periodic triage: `kb inbox process` (manual) + `kb lint` (regenerates index).
+
+## Concurrency rules
+
+Up to 4 parallel Claude sessions may write here.
+
+- **New entries are unique timestamped files** — no filename collisions.
+- **`MEMORY.md` and `log.md` mutations MUST go through `kb`** (uses file locks).
+- **Never `Edit`/`Write` MEMORY.md or log.md directly** from multiple sessions.
+- Same wiki page edited concurrently: last-writer-wins; recover via local git.
+
+## Anti-patterns
+
+- Don't restate facts already in the source repo — link instead.
+- Don't write narrative prose. Be terse, structured, scannable.
+- Don't add a git remote.
+EOF
+
+  cat > "$target/.gitignore" <<'EOF'
+.DS_Store
+.locks/
+inbox/*
+!inbox/.gitkeep
+EOF
+  touch "$target/inbox/.gitkeep"
+
+  (cd "$target" && git init -q && git add -A && git commit -q -m "kb init") || {
+    echo "kb init: git init failed (continuing without git)" >&2
+  }
+  echo "Scaffolded KB at: $target"
+}
+
+cmd_path() {
+  _kb_resolve_path
+}
+
+cmd_note() {
+  local slug="${1:-}"
+  [[ -z "$slug" ]] && { echo "usage: kb note <slug>" >&2; return 1; }
+  local kb; kb=$(_kb_resolve_path) || return 1
+  local sess; sess=$(_kb_session)
+  local ts; ts=$(date +%Y%m%d-%H%M%S)
+  local clean; clean=$(_kb_slug "$slug")
+  local file="$kb/inbox/${ts}-${sess}-${clean}.md"
+  cat > "$file" <<EOF
+---
+created: $(date +%Y-%m-%dT%H:%M:%S%z)
+session: $sess
+slug: $clean
+---
+
+# $slug
+
+EOF
+  echo "$file"
+  _kb_open "$file"
+}
+
+cmd_meeting() {
+  local topic="${1:-}"
+  [[ -z "$topic" ]] && { echo "usage: kb meeting <topic>" >&2; return 1; }
+  local kb; kb=$(_kb_resolve_path) || return 1
+  local clean; clean=$(_kb_slug "$topic")
+  local file="$kb/meetings/$(date +%Y-%m-%d-%H-%M)-${clean}.md"
+  if [[ ! -e "$file" ]]; then
+    cat > "$file" <<EOF
+---
+date: $(date +%Y-%m-%d)
+topic: $topic
+attendees:
+---
+
+# $topic — $(date +%Y-%m-%d)
+
+## Agenda
+
+## Notes
+
+## Decisions
+
+## Action items
+EOF
+  fi
+  echo "$file"
+  _kb_open "$file"
+}
+
+_log_append() {
+  local kb="$1" kind="$2" title="$3"
+  printf '## [%s] %s | %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$kind" "$title" >> "$kb/log.md"
+}
+
+cmd_log() {
+  local kind="${1:-}"; shift || true
+  local title="$*"
+  if [[ -z "$kind" || -z "$title" ]]; then
+    echo "usage: kb log <kind> <title...>" >&2; return 1
+  fi
+  local kb; kb=$(_kb_resolve_path) || return 1
+  _kb_with_lock "$kb" log _log_append "$kb" "$kind" "$title"
+}
+
+_memory_add() {
+  local kb="$1" type="$2" name="$3"
+  local file="memory/${type}_${name}.md"
+  if [[ ! -e "$kb/$file" ]]; then
+    cat > "$kb/$file" <<EOF
+---
+name: $name
+description: (one-line description)
+type: $type
+---
+
+(content)
+EOF
+  fi
+  local section
+  case "$type" in
+    user)      section="## User" ;;
+    feedback)  section="## Feedback" ;;
+    project)   section="## Project" ;;
+    reference) section="## Reference" ;;
+    *)         echo "kb memory: type must be user|feedback|project|reference" >&2; return 1 ;;
+  esac
+  local line="- [${name}](${file}) — (one-line hook)"
+  if grep -qF "$line" "$kb/MEMORY.md" 2>/dev/null; then
+    return 0
+  fi
+  awk -v sect="$section" -v line="$line" '
+    { print }
+    $0 == sect && !done { print line; done=1 }
+  ' "$kb/MEMORY.md" > "$kb/MEMORY.md.tmp"
+  mv "$kb/MEMORY.md.tmp" "$kb/MEMORY.md"
+  echo "$kb/$file"
+}
+
+cmd_memory() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    add)
+      local type="${1:-}" name="${2:-}"
+      [[ -z "$type" || -z "$name" ]] && { echo "usage: kb memory add <type> <name>" >&2; return 1; }
+      local kb; kb=$(_kb_resolve_path) || return 1
+      local clean; clean=$(_kb_slug "$name")
+      _kb_with_lock "$kb" memory _memory_add "$kb" "$type" "$clean"
+      ;;
+    list|"")
+      local kb; kb=$(_kb_resolve_path) || return 1
+      ls -1 "$kb/memory/" 2>/dev/null | grep -v '^\.' || true
+      ;;
+    *) echo "usage: kb memory {add|list}" >&2; return 1 ;;
+  esac
+}
+
+cmd_inbox() {
+  local kb; kb=$(_kb_resolve_path) || return 1
+  ls -1 "$kb/inbox/" 2>/dev/null | grep -v '^\.gitkeep$' | grep -v '^\.' || true
+}
+
+_lint_rebuild() {
+  local kb="$1"
+  {
+    echo "# Index"
+    echo
+    echo "_Auto-generated by \`kb lint\` at $(date +%Y-%m-%dT%H:%M:%S). Do not edit by hand._"
+    echo
+    for dir in wiki meetings memory decisions; do
+      [[ -d "$kb/$dir" ]] || continue
+      local files
+      files=$(ls -1 "$kb/$dir/" 2>/dev/null | grep '\.md$' | grep -v '^\.' | grep -v '^README\.md$' | grep -v '^_' || true)
+      [[ -z "$files" ]] && continue
+      echo "## $dir/"
+      echo
+      while IFS= read -r f; do
+        local title
+        title=$(awk '/^# / { sub(/^# /, ""); print; exit }' "$kb/$dir/$f")
+        [[ -z "$title" ]] && title="$f"
+        echo "- [$title]($dir/$f)"
+      done <<< "$files"
+      echo
+    done
+  } > "$kb/index.md"
+  echo "Rebuilt $kb/index.md"
+}
+
+cmd_lint() {
+  local kb; kb=$(_kb_resolve_path) || return 1
+  _kb_with_lock "$kb" lint _lint_rebuild "$kb"
+}
+
+
+# ── decisions ──────────────────────────────────────────────────────────────
+
+cmd_decision() {
+  local slug="${1:-}"
+  [[ -z "$slug" ]] && { echo "usage: kb decision <slug>" >&2; return 1; }
+  local kb; kb=$(_kb_resolve_path) || return 1
+  local clean; clean=$(_kb_slug "$slug")
+  local today; today=$(date +%Y-%m-%d)
+  local file="$kb/decisions/${today}-${clean}.md"
+  mkdir -p "$kb/decisions"
+  if [[ -e "$file" ]]; then
+    echo "$file"
+    _kb_open "$file"
+    return 0
+  fi
+  cat > "$file" <<EOF
+---
+name: $clean
+date: $today
+status: accepted
+supersedes:
+superseded_by:
+tags: []
+related: []
+---
+
+# (imperative one-liner)
+
+## Context
+
+(what was true that forced a choice)
+
+## Decision
+
+(what we chose, flatly, present tense)
+
+## Alternatives rejected
+
+- **(option)** — (the actual reason it lost)
+
+## Consequences
+
+(what this commits you to, including the bad parts)
+
+## Revisit when
+
+(the condition that should reopen this — not optional)
+EOF
+  echo "$file"
+  _kb_open "$file"
+}
+
+# ── session digests ────────────────────────────────────────────────────────
+
+cmd_digest() {
+  local slug="${1:-}"
+  [[ -z "$slug" ]] && { echo "usage: kb digest <slug>" >&2; return 1; }
+  local kb; kb=$(_kb_resolve_path) || return 1
+  local clean; clean=$(_kb_slug "$slug")
+  local today; today=$(date +%Y-%m-%d)
+
+  # repo + branch of the cwd the digest is written about (worktree -> main repo).
+  local repo branch
+  IFS=$'\t' read -r repo branch < <(_kb_repo_branch "$PWD")
+
+  local file="$kb/sessions/${today}-${repo}-${clean}.md"
+  mkdir -p "$kb/sessions"
+  if [[ -e "$file" ]]; then
+    echo "$file"
+    _kb_open "$file"
+    return 0
+  fi
+  cat > "$file" <<EOF
+---
+date: $today
+repo: $repo
+branch: $branch
+session: ${KB_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}
+tickets: []
+status: wip
+related: []
+---
+
+# (one-line title: what this session was actually about)
+
+## Task
+
+## Decisions
+
+## Findings
+
+## Changed
+
+## Open
+
+## Dead ends
+EOF
+  echo "$file"
+  _kb_open "$file"
+}
+
+# ── digest queue (fed by a SessionEnd hook) ────────────────────────────────
+
+_queue_file() { echo "$1/.session-queue.jsonl"; }
+
+cmd_queue() {
+  local sub="${1:-list}"; shift || true
+  local kb; kb=$(_kb_resolve_path) || return 1
+  local qf; qf=$(_queue_file "$kb")
+  case "$sub" in
+    add)
+      # kb queue add <session_id> <transcript_path> <cwd>
+      local sid="${1:-}" tpath="${2:-}" cwd="${3:-}"
+      [[ -z "$sid" ]] && { echo "usage: kb queue add <session_id> <transcript> <cwd>" >&2; return 1; }
+      # Locked: SessionEnd can fire in several sessions at once.
+      # Deduped: PreCompact enqueues a session that SessionEnd then enqueues again,
+      # and a long session compacts more than once. One queue line per session id.
+      _kb_lock "$kb" "queue" || return 1
+      if [[ -f "$qf" ]] && /usr/bin/grep -q "\"session\":\"$sid\"" "$qf"; then
+        _kb_unlock "$kb" "queue"; return 0
+      fi
+      printf '{"ts":"%s","session":"%s","transcript":"%s","cwd":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$tpath" "$cwd" >> "$qf"
+      _kb_unlock "$kb" "queue"
+      ;;
+    remove)
+      # Drop one session's entry. Used by a digest batch job after a successful
+      # (or deliberately skipped) digest, so a later failure elsewhere cannot
+      # cause this session to be re-digested and re-paid for.
+      local sid="${1:?usage: kb queue remove <session_id>}"
+      _kb_lock "$kb" "queue" || return 1
+      if [[ -f "$qf" ]]; then
+        /usr/bin/grep -v "\"session\":\"$sid\"" "$qf" > "$qf.tmp" || true
+        mv "$qf.tmp" "$qf"
+      fi
+      _kb_unlock "$kb" "queue"
+      ;;
+    bump)
+      # Record a failed attempt on <sid> and drop the entry once it reaches
+      # <max> (default 3). Without a cap, one transcript the model always
+      # chokes on would be retried every night forever.
+      local sid="${1:?usage: kb queue bump <session_id> [max]}" max="${2:-3}"
+      _kb_lock "$kb" "queue" || return 1
+      # `set -e` is on at the top of this script, so a failure inside the lock
+      # would abort before _kb_unlock and orphan .locks/queue.d, wedging every
+      # later queue write until someone rmdir's it by hand. Capture, unlock,
+      # then report.
+      local rc=0
+      if [[ -f "$qf" ]]; then
+        SID="$sid" MAX="$max" python3 - "$qf" <<'BUMP' || rc=$?
+import json, os, sys
+qf, sid, mx = sys.argv[1], os.environ['SID'], int(os.environ['MAX'])
+out = []
+for ln in open(qf):
+    ln = ln.strip()
+    if not ln: continue
+    try: e = json.loads(ln)
+    except Exception: out.append(ln); continue      # keep unparseable lines
+    if e.get('session') != sid: out.append(ln); continue
+    e['attempts'] = int(e.get('attempts', 0)) + 1
+    if e['attempts'] >= mx:
+        print(f"kb queue: dropping {sid} after {e['attempts']} failed attempts", file=sys.stderr)
+        continue
+    out.append(json.dumps(e, separators=(',', ':')))
+with open(qf, 'w') as f:
+    for l in out: print(l, file=f)
+BUMP
+      fi
+      _kb_unlock "$kb" "queue"
+      return $rc
+      ;;
+    list|"")   [[ -f "$qf" ]] && cat "$qf" || true ;;
+    count)     [[ -f "$qf" ]] && wc -l < "$qf" | tr -d ' ' || echo 0 ;;
+    clear)     : > "$qf"; echo "cleared $qf" ;;
+    path)      echo "$qf" ;;
+    *) echo "usage: kb queue {add|remove|bump|list|count|clear|path}" >&2; return 1 ;;
+  esac
+}
+
+# ── sessions window ───────────────────────────────────────────────────────
+
+# Tools that sync or load a whole directory have no notion of a date range, so
+# a "last 14 days" window only exists if aged digests are physically moved out
+# of sessions/. Archive is a SIBLING directory, not a subdirectory: syncing
+# sessions/ would pull a subdirectory in with it.
+cmd_sessions() {
+  local sub="${1:-}"; shift || true
+  local kb; kb=$(_kb_resolve_path) || return 1
+  case "$sub" in
+    prune)
+      local days="${1:-14}"
+      local live="$kb/sessions" arch="$kb/sessions-archive"
+      local cutoff; cutoff=$(date -v-"${days}"d +%Y-%m-%d) || return 1
+      mkdir -p "$arch"
+      local moved=0 f base d
+      for f in "$live"/*.md; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "README.md" ]] && continue
+        # Date comes from the FILENAME, not mtime: a git checkout or a later
+        # edit rewrites mtime and would resurrect or prematurely retire one.
+        d="${base:0:10}"
+        [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "  skip $base: no date prefix"; continue; }
+        if [[ "$d" < "$cutoff" ]]; then
+          mv "$f" "$arch/$base" && moved=$((moved+1))
+        fi
+      done
+      echo "kb sessions prune: $moved digest(s) older than $cutoff -> sessions-archive/"
+      ;;
+    *) echo "usage: kb sessions prune [days]" >&2; return 1 ;;
+  esac
+}
+
+# ── git sync ───────────────────────────────────────────────────────────────
+
+cmd_sync() {
+  local kb; kb=$(_kb_resolve_path) || return 1
+  git -C "$kb" remote get-url origin >/dev/null 2>&1 || {
+    echo "kb sync: no 'origin' remote configured" >&2; return 1; }
+
+  echo "── pull --rebase ──"
+  git -C "$kb" pull --rebase --autostash || {
+    echo "kb sync: pull failed — resolve manually in $kb" >&2; return 1; }
+
+  if [[ -z "$(git -C "$kb" status --porcelain)" ]]; then
+    echo "kb sync: nothing to commit; pushing any local commits"
+  else
+    git -C "$kb" add -A
+    local n; n=$(git -C "$kb" diff --cached --name-only | wc -l | tr -d ' ')
+    git -C "$kb" commit -q -m "kb sync: $n file(s) from $(hostname -s) $(date +%Y-%m-%dT%H:%M)"
+    echo "committed $n file(s)"
+  fi
+
+  git -C "$kb" push origin HEAD
+  echo "kb sync: done"
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  init)    shift; cmd_init "$@" ;;
+  path)    cmd_path ;;
+  note)    shift; cmd_note "$@" ;;
+  meeting) shift; cmd_meeting "$@" ;;
+  log)     shift; cmd_log "$@" ;;
+  memory)  shift; cmd_memory "$@" ;;
+  inbox)   cmd_inbox ;;
+  decision) shift; cmd_decision "$@" ;;
+  digest)  shift; cmd_digest "$@" ;;
+  repo)    shift; cmd_repo "$@" ;;
+  queue)   shift; cmd_queue "$@" ;;
+  sessions) shift; cmd_sessions "$@" ;;
+  sync)    cmd_sync ;;
+  lint)    cmd_lint ;;
+  --help|-h|"") usage ;;
+  *)
+    echo "kb: unknown command: $1" >&2
+    echo "Run 'kb --help' for usage." >&2
+    exit 1
+    ;;
+esac

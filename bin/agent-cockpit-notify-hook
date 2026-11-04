@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Claude Code Notification hook for agent-cockpit sidebar notifications.
+# Writes notification type to state file so the sidebar can display it.
+# No-op outside agent-cockpit sessions (guard on AC_STATE_DIR / AC_SLOT).
+
+[[ -z "${AC_STATE_DIR:-}" || -z "${AC_SLOT:-}" ]] && exit 0
+
+# Read JSON from stdin, extract notification_type and transcript_path in one python call
+input=$(cat)
+IFS='|' read -r notification_type transcript_path < <(
+    printf '%s' "$input" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d.get('notification_type','') + '|' + d.get('transcript_path',''))
+" 2>/dev/null
+) || exit 0
+
+case "$notification_type" in
+    idle_prompt)
+        printf '%s' "done" > "$AC_STATE_DIR/notif$AC_SLOT"
+        : > "$AC_STATE_DIR/notif_msg$AC_SLOT"
+        ;;
+    permission_prompt)
+        printf '%s' "question" > "$AC_STATE_DIR/notif$AC_SLOT"
+        # Extract context summary from transcript
+        notif_msg=""
+        if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
+            notif_msg=$(tail -5 "$transcript_path" | python3 -c "
+import sys, json, os
+summary = ''
+for line in reversed(sys.stdin.read().strip().split('\n')):
+    if not line.strip():
+        continue
+    try:
+        obj = json.loads(line)
+    except:
+        continue
+    if obj.get('type') != 'assistant':
+        continue
+    content = obj.get('message', {}).get('content', [])
+    if not isinstance(content, list):
+        continue
+    tool = None
+    for block in content:
+        if isinstance(block, dict) and block.get('type') == 'tool_use':
+            tool = block
+    if not tool:
+        continue
+    name = tool.get('name', '')
+    inp = tool.get('input', {})
+    if name == 'Bash':
+        d = inp.get('description', '')
+        if d:
+            summary = 'Bash: ' + d
+        else:
+            summary = 'Bash: ' + inp.get('command', '').split(chr(10))[0]
+    elif name in ('Edit', 'Write', 'Read'):
+        fp = inp.get('file_path', '')
+        summary = name + ': ' + os.path.basename(fp) if fp else name
+    elif name == 'Glob':
+        summary = 'Glob: ' + inp.get('pattern', '')
+    elif name == 'Grep':
+        summary = 'Grep: ' + inp.get('pattern', '')
+    else:
+        summary = name
+    break
+print(summary)
+" 2>/dev/null) || notif_msg=""
+        fi
+        printf '%s' "$notif_msg" > "$AC_STATE_DIR/notif_msg$AC_SLOT"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+# Trigger sidebar refresh
+printf '.\n' >> "$AC_STATE_DIR/notify"

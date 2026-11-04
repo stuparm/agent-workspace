@@ -1,0 +1,23 @@
+FROM claude:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Switch to root for installations ────────────────────────────────────────
+USER root
+
+# ── Foundry (forge, cast, anvil, chisel) ─────────────────────────────────────
+RUN curl -L https://foundry.paradigm.xyz | bash \
+    && /root/.foundry/bin/foundryup
+
+# ── Hardhat ───────────────────────────────────────────────────────────────────
+RUN npm install -g hardhat pnpm
+
+# ── Move root-installed tools to system-wide paths ───────────────────────────
+RUN cp /root/.foundry/bin/* /usr/local/bin/
+
+# ── Switch back to non-root user ─────────────────────────────────────────────
+USER claude
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

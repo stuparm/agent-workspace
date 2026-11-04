@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Merge harness usage rows into the sidebar's cache file. The only writer of
+# $XDG_CACHE_HOME/agent-cockpit/usage/<harness>.tsv — producers (the Claude statusLine
+# wrapper, the Codex log reader) pipe rows here instead of writing the file themselves.
+#
+# Usage: agent-cockpit-usage-write HARNESS < rows
+#   row: label<TAB>used_pct<TAB>resets_at[<TAB>reported_at]   (integers, epoch seconds;
+#        reported_at defaults to now)
+#
+# Merge rule per label: the newest observation wins. An incoming row replaces the cached
+# one if the cached row has expired or the incoming reported_at is at least as recent,
+# whether its pct is higher or lower. Usage does drop inside a window (a switch to
+# another account, a limit reset), so a higher pct is no sign of fresher data. Producers
+# must therefore pass the time the numbers were observed, not the time they are piped
+# here: an idle session's statusline still carries numbers from hours ago, and it must
+# not drag the shown value back to them.
+
+HARNESS="${1:?Usage: agent-cockpit-usage-write HARNESS < rows}"
+[[ "$HARNESS" =~ ^[a-z0-9_-]+$ ]] || exit 2
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-cockpit/usage"
+CACHE_FILE="$CACHE_DIR/$HARNESS.tsv"
+INT_RE='^[0-9]+$'
+NOW=$(date +%s)
+
+LABELS=()
+PCTS=()
+RESETS=()
+REPORTED=()
+
+valid_row() {
+    [[ -n "$1" && "$2" =~ $INT_RE && "$3" =~ $INT_RE && "$4" =~ $INT_RE ]]
+}
+
+if [[ -f "$CACHE_FILE" ]]; then
+    while IFS=$'\t' read -r label pct reset reported; do
+        valid_row "$label" "$pct" "$reset" "${reported:-}" || continue
+        LABELS+=("$label"); PCTS+=("$pct"); RESETS+=("$reset"); REPORTED+=("$reported")
+    done < "$CACHE_FILE"
+fi
+
+changed=0
+while IFS=$'\t' read -r label pct reset reported; do
+    [[ "${reported:-}" =~ $INT_RE ]] || reported=$NOW
+    valid_row "$label" "$pct" "$reset" "$reported" || continue
+    (( reset > NOW )) || continue
+
+    idx=-1
+    for (( i = 0; i < ${#LABELS[@]}; i++ )); do
+        [[ "${LABELS[$i]}" == "$label" ]] && { idx=$i; break; }
+    done
+
+    if (( idx < 0 )); then
+        LABELS+=("$label"); PCTS+=("$pct"); RESETS+=("$reset"); REPORTED+=("$reported")
+        changed=1
+    elif (( RESETS[idx] <= NOW || reported >= REPORTED[idx] )); then
+        if [[ "${PCTS[$idx]} ${RESETS[$idx]} ${REPORTED[$idx]}" != "$pct $reset $reported" ]]; then
+            PCTS[$idx]=$pct; RESETS[$idx]=$reset; REPORTED[$idx]=$reported
+            changed=1
+        fi
+    fi
+done
+
+(( changed )) || exit 0
+
+[[ -d "$CACHE_DIR" ]] || mkdir -p "$CACHE_DIR" || exit 1
+TMP=$(mktemp "$CACHE_DIR/.$HARNESS.XXXXXX") || exit 1
+trap 'rm -f "$TMP"' EXIT
+for (( i = 0; i < ${#LABELS[@]}; i++ )); do
+    printf '%s\t%s\t%s\t%s\n' "${LABELS[$i]}" "${PCTS[$i]}" "${RESETS[$i]}" "${REPORTED[$i]}"
+done > "$TMP"
+mv -f "$TMP" "$CACHE_FILE"

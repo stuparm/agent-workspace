@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+# Claude Code statusLine wrapper, installed into the global settings by install.sh.
+# It records the account's rate limits (5-hour + weekly) for the cockpit sidebar, then
+# runs the user's real statusline command with the same input, so the bar is unchanged.
+#
+# The real command lives in ${CLAUDE_CONFIG_DIR:-~/.claude}/agent-cockpit-statusline.cmd.
+# To change the statusline, edit that file (or change settings.json and re-run
+# install.sh) — not this script.
+
+# Guard against the wrapper ending up as its own delegate
+[[ -n "${AC_SL_INNER:-}" ]] && exit 0
+export AC_SL_INNER=1
+
+input=$(cat)
+
+# The statusline repaints at any time, but rate_limits only change with a response, so
+# the rows are stamped with the transcript's mtime (≈ the session's last response). An
+# idle pane repainting old numbers then loses to fresher ones from another pane. Without
+# a transcript the writer stamps them with now. Caveat: /login is written to the
+# transcript too, so a pane that just logged in repaints the old account's numbers once
+# more — until any pane gets a response from the new account.
+seen=""
+transcript=$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null)
+if [[ -n "$transcript" && -f "$transcript" ]]; then
+    # GNU first: on GNU, `stat -f` is filesystem mode and prints before it fails
+    seen=$(stat -c %Y "$transcript" 2>/dev/null || stat -f %m "$transcript" 2>/dev/null)
+    [[ "$seen" =~ ^[0-9]+$ ]] || seen=""
+fi
+
+# rate_limits is absent until a session's first response — then nothing is written
+rows=$(jq -r --arg seen "$seen" '
+    .rate_limits // empty
+    | (["5h", .five_hour], ["week", .seven_day])
+    | select(.[1].used_percentage != null and .[1].resets_at != null)
+    | [.[0], (.[1].used_percentage | round), (.[1].resets_at | floor)]
+      + (if $seen == "" then [] else [$seen] end)
+    | @tsv' <<<"$input" 2>/dev/null)
+if [[ -n "$rows" ]]; then
+    writer="${0%/*}/agent-cockpit-usage-write"
+    [[ -x "$writer" ]] || writer=agent-cockpit-usage-write
+    "$writer" claude <<<"$rows" >/dev/null 2>&1
+fi
+
+cmd_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agent-cockpit-statusline.cmd"
+[[ -s "$cmd_file" ]] || exit 0
+exec /bin/sh -c "$(<"$cmd_file")" <<<"$input"

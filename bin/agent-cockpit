@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION_PREFIX="ac-"
+DEFAULT_NAME="default"
+FOCUS=false
+
+# Focus-mode colors (override via environment variables)
+# tmux has no pane opacity — dim fades text, bg color fades the background
+AC_ACTIVE_BG="${AC_ACTIVE_BG:-#000000}"
+AC_INACTIVE_BG="${AC_INACTIVE_BG:-colour236}"
+
+usage() {
+    cat <<'EOF'
+Usage: agent-cockpit [NAME] [--focus]
+       agent-cockpit attach [NAME] [--focus]
+       agent-cockpit kill [NAME]
+       agent-cockpit prune
+       agent-cockpit list
+       agent-cockpit --help
+
+Commands:
+  [NAME]          Create and attach to session (default: "default")
+  attach [NAME]   Attach to an existing session
+  kill   [NAME]   Destroy a session
+  prune           Interactively delete sessions via fzf (multi-select)
+  list            List all agent-cockpit sessions
+
+Options:
+  --focus         Dim inactive panes to highlight the focused agent
+
+Examples:
+  agent-cockpit                  # creates ac-default
+  agent-cockpit my-project       # creates ac-my-project
+  agent-cockpit my-project --focus  # creates with focus dimming
+  agent-cockpit list             # list all ac-* sessions
+  agent-cockpit prune            # multi-select sessions to kill
+  agent-cockpit attach my-project
+  agent-cockpit attach my-project --focus
+  agent-cockpit kill my-project
+
+Layout:
+  ┌─────────────┬─────────────┬──────────┐
+  │ Agent 1      │ Agent 2      │          │
+  │              │              │ Cockpit  │
+  ├─────────────┼─────────────┤ (sidebar)│
+  │ Agent 3      │ Agent 4      │          │
+  │              │              │          │
+  └─────────────┴─────────────┴──────────┘
+       80% agents                 20%
+
+Keys:
+  prefix + F1-F4   focus agent pane 1-4
+  prefix + F5      focus cockpit sidebar
+
+Sidebar (↑↓ to pick, ↵ to open), per agent folder:
+  GoLand, VS Code  open the folder in the IDE
+  Terminal         a shell in a popup over the whole layout, started in that folder.
+                   Typing hide (or prefix + d) hides it and keeps it running (reopen shows
+                   it as it was); exit ends it, and the next open starts in the sidebar's
+                   folder again.
+                   Needs tmux 3.3+.
+
+Focus-mode colors (environment variables):
+  AC_ACTIVE_BG     active pane background   (default: "default" = terminal bg)
+  AC_ACTIVE_FG     active pane foreground   (default: "default" = terminal fg)
+  AC_INACTIVE_BG   inactive pane background (default: "colour235" = #262626)
+  AC_INACTIVE_FG   inactive pane foreground (default: "colour240" = #585858)
+
+  Values: any tmux color — "default", "black", "colour0"-"colour255", or "#rrggbb"
+  Example: AC_INACTIVE_BG=colour238 agent-cockpit --focus
+
+Sidebar IDE launch (environment variables):
+  AC_GOLAND_APP    path to GoLand.app          (default: auto-detect)
+  AC_VSCODE_APP    path to Visual Studio Code.app (default: auto-detect)
+
+  Auto-detect looks in ~/Applications then /Applications. Launch failures are
+  appended to /tmp/<session>/ide.log.
+
+Sidebar usage limits (environment variable, needs ./install.sh):
+  AC_USAGE         harnesses whose limits to show, comma-separated: claude, codex
+                   (default: unset = no usage block)
+
+  Example: AC_USAGE=claude agent-cockpit
+  Read when the session is created; for a running session, restart the sidebar
+  (prefix + F5, Ctrl-C, then: AC_USAGE=claude agent-cockpit-sidebar <session>).
+EOF
+    exit 1
+}
+
+resolve_session() {
+    local name="${1:-$DEFAULT_NAME}"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    name=$(echo "$name" | sed 's/[^a-z0-9_-]//g')
+    name="${name#"$SESSION_PREFIX"}"
+    if [ -z "$name" ]; then
+        name="$DEFAULT_NAME"
+    fi
+    SESSION="${SESSION_PREFIX}${name}"
+}
+
+apply_focus_styles() {
+    # dim: fades text (universal, controlled by terminal's "faint text" setting)
+    # bg:  fades background (tmux has no opacity — explicit color is the only way)
+    tmux set-option -t "$SESSION" window-style "dim,bg=${AC_INACTIVE_BG}"
+    tmux set-option -t "$SESSION" window-active-style "nodim,bg=${AC_ACTIVE_BG}"
+}
+
+list_sessions() {
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}|#{session_created}|#{session_windows}|#{session_attached}' 2>/dev/null | grep "^${SESSION_PREFIX}" || true)
+
+    if [ -z "$sessions" ]; then
+        echo "No agent-cockpit sessions found."
+        exit 0
+    fi
+
+    printf "%-20s %-22s %-8s %s\n" "NAME" "CREATED" "WINDOWS" "STATUS"
+    printf "%-20s %-22s %-8s %s\n" "----" "-------" "-------" "------"
+
+    while IFS='|' read -r sname created windows attached; do
+        local display_name="${sname#"$SESSION_PREFIX"}"
+        local created_fmt
+        created_fmt=$(date -r "$created" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$created")
+        local status="detached"
+        if [ "$attached" -gt 0 ] 2>/dev/null; then
+            status="attached"
+        fi
+        printf "%-20s %-22s %-8s %s\n" "$display_name" "$created_fmt" "$windows" "$status"
+    done <<< "$sessions"
+
+    exit 0
+}
+
+# Hidden terminal sessions opened from the sidebar (open_terminal in agent-cockpit-sidebar).
+# Swept even when the session itself is already gone, so none are left behind.
+kill_terminals() {
+    local i
+    for i in 1 2 3 4; do
+        tmux kill-session -t "=_${1}-t$i" 2>/dev/null || true
+    done
+}
+
+kill_session() {
+    kill_terminals "$SESSION"
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        tmux kill-session -t "$SESSION"
+        rm -rf "/tmp/${SESSION}"
+        echo "Session '$SESSION' destroyed."
+    else
+        echo "No session '$SESSION' found."
+    fi
+    exit 0
+}
+
+prune_sessions() {
+    if ! command -v fzf &> /dev/null; then
+        echo "ERROR: fzf is required for interactive pruning." >&2
+        echo "Install: brew install fzf  (macOS) or apt install fzf  (Linux)" >&2
+        exit 1
+    fi
+
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}|#{session_created}|#{session_attached}' 2>/dev/null | grep "^${SESSION_PREFIX}" || true)
+
+    if [ -z "$sessions" ]; then
+        echo "No agent-cockpit sessions found."
+        exit 0
+    fi
+
+    local display=""
+    while IFS='|' read -r sname created attached; do
+        local display_name="${sname#"$SESSION_PREFIX"}"
+        local created_fmt
+        created_fmt=$(date -r "$created" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$created")
+        local status="detached"
+        if [ "$attached" -gt 0 ] 2>/dev/null; then
+            status="attached"
+        fi
+        display+="$(printf '%-20s %-22s %s' "$display_name" "$created_fmt" "$status")"$'\n'
+    done <<< "$sessions"
+    display="${display%$'\n'}"
+
+    local selected
+    selected=$(echo "$display" | fzf --multi --header="TAB to toggle, ENTER to confirm deletion") || {
+        echo "No sessions selected."
+        exit 0
+    }
+
+    while IFS= read -r line; do
+        local name
+        name=$(echo "$line" | awk '{print $1}')
+        local session="${SESSION_PREFIX}${name}"
+        kill_terminals "$session"
+        if tmux has-session -t "$session" 2>/dev/null; then
+            tmux kill-session -t "$session"
+            rm -rf "/tmp/${session}"
+            echo "Session '$session' destroyed."
+        fi
+    done <<< "$selected"
+
+    exit 0
+}
+
+attach_session() {
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "Error: session '$SESSION' does not exist. Run 'agent-cockpit' first."
+        exit 1
+    fi
+    if [ "$FOCUS" = true ]; then
+        apply_focus_styles
+    fi
+    exec tmux attach-session -t "$SESSION"
+}
+
+create_session() {
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "Error: session '$SESSION' already exists."
+        echo "  Use 'attach' to reattach, or 'kill' to destroy it first."
+        exit 1
+    fi
+
+    local clear_notif_cmd
+    clear_notif_cmd="$(command -v agent-cockpit-clear-notif)"
+
+    local cols rows
+    cols=$(tput cols 2>/dev/null) || cols=200
+    rows=$(tput lines 2>/dev/null) || rows=50
+
+    # ── Window 0: 2x2 agent grid (80%) + sidebar (20%) ──
+
+    tmux new-session -d -s "$SESSION" -n "Main" -x "$cols" -y "$rows"
+
+    # Initial pane = Agent 1 (will become top-left of 80% area)
+    local pane_a1
+    pane_a1=$(tmux display-message -t "$SESSION:0" -p '#{pane_id}')
+
+    # Split off the sidebar (right 20%, full height)
+    tmux split-window -t "$pane_a1" -h -p 20
+    local pane_sidebar
+    pane_sidebar=$(tmux display-message -t "$SESSION:0" -p '#{pane_id}')
+
+    # Split agent1 vertically — bottom becomes agent3
+    tmux split-window -t "$pane_a1" -v -p 50
+    local pane_a3
+    pane_a3=$(tmux display-message -t "$SESSION:0" -p '#{pane_id}')
+
+    # Split agent1 horizontally — right becomes agent2
+    tmux split-window -t "$pane_a1" -h -p 50
+    local pane_a2
+    pane_a2=$(tmux display-message -t "$SESSION:0" -p '#{pane_id}')
+
+    # Split agent3 horizontally — right becomes agent4
+    tmux split-window -t "$pane_a3" -h -p 50
+    local pane_a4
+    pane_a4=$(tmux display-message -t "$SESSION:0" -p '#{pane_id}')
+
+    # ── Session options ──
+
+    tmux set-option -t "$SESSION" mouse on
+    tmux set-option -t "$SESSION" pane-border-style "fg=#5a3a2a"
+    tmux set-option -t "$SESSION" pane-active-border-style "fg=#d97757"
+
+    # Enable focus events so pane-focus-in hook fires (server option, must be global)
+    tmux set-option -g focus-events on
+
+    # Clear notifications when a pane receives focus
+    tmux set-hook -t "$SESSION" pane-focus-in \
+        "run-shell -b \"$clear_notif_cmd $SESSION #{pane_id}\""
+    # Also clear on pane switch within tmux (pane-focus-in requires terminal focus events;
+    # window-pane-changed fires reliably on all internal pane switches)
+    tmux set-hook -t "$SESSION" window-pane-changed \
+        "run-shell -b \"$clear_notif_cmd $SESSION #{pane_id}\""
+
+    # Enable extended keys so Shift+Enter works in Claude Code
+    tmux set-option -t "$SESSION" extended-keys always
+    tmux set-option -sa -t "$SESSION" terminal-features 'xterm*:extkeys'
+
+    # Pane titles (window-level options)
+    tmux set-window-option -t "$SESSION:0" pane-border-status top
+    tmux set-window-option -t "$SESSION:0" pane-border-format " #{pane_title} "
+
+    # ── Pane titles ──
+    # Disable automatic rename so shell prompts don't override our titles
+    tmux set-window-option -t "$SESSION:0" allow-rename off
+    tmux set-option -t "$SESSION" set-titles off
+
+    # Small delay to let shells finish initializing their prompts
+    sleep 0.3
+
+    tmux select-pane -t "$pane_a1" -T "Agent 1"
+    tmux select-pane -t "$pane_a2" -T "Agent 2"
+    tmux select-pane -t "$pane_a3" -T "Agent 3"
+    tmux select-pane -t "$pane_a4" -T "Agent 4"
+    tmux select-pane -t "$pane_sidebar" -T "Cockpit"
+    if [ "$FOCUS" = false ]; then
+        tmux select-pane -t "$pane_sidebar" -P 'bg=#141413,fg=#d97757'
+    fi
+
+    # ── Store pane mappings in session environment ──
+
+    tmux set-environment -t "$SESSION" AGENT_PANE_1 "$pane_a1"
+    tmux set-environment -t "$SESSION" AGENT_PANE_2 "$pane_a2"
+    tmux set-environment -t "$SESSION" AGENT_PANE_3 "$pane_a3"
+    tmux set-environment -t "$SESSION" AGENT_PANE_4 "$pane_a4"
+    tmux set-environment -t "$SESSION" SIDEBAR_PANE "$pane_sidebar"
+
+    # ── State directory + shell hooks ──
+
+    local state_dir="/tmp/${SESSION}"
+    mkdir -p "$state_dir"
+
+    local initial_cwd
+    initial_cwd=$(pwd)
+    for i in 1 2 3 4; do
+        printf '%s' "$initial_cwd" > "$state_dir/slot$i"
+        : > "$state_dir/notif$i"
+        : > "$state_dir/notif_msg$i"
+    done
+    touch "$state_dir/notify"
+
+    cat > "$state_dir/hook.sh" << 'HOOKEOF'
+_ac_update_dir() {
+    printf '%s' "$PWD" > "${AC_STATE_DIR}/slot${AC_SLOT}"
+    printf '.\n' >> "${AC_STATE_DIR}/notify"
+}
+if [ -n "${ZSH_VERSION:-}" ]; then
+    chpwd_functions+=(_ac_update_dir)
+else
+    PROMPT_COMMAND="_ac_update_dir${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
+_ac_update_dir
+HOOKEOF
+
+    # Inject shell hooks into the agent panes
+    for i in 1 2 3 4; do
+        eval "local ap=\$pane_a$i"
+        tmux send-keys -t "$ap" "export AC_SLOT=$i AC_STATE_DIR=$state_dir; source \$AC_STATE_DIR/hook.sh; clear" Enter
+    done
+
+    # ── Key bindings ──
+
+    # prefix + F1-F4 to focus agent panes
+    tmux bind-key -T prefix F1 select-pane -t "$pane_a1"
+    tmux bind-key -T prefix F2 select-pane -t "$pane_a2"
+    tmux bind-key -T prefix F3 select-pane -t "$pane_a3"
+    tmux bind-key -T prefix F4 select-pane -t "$pane_a4"
+
+    # prefix + F5 to focus cockpit sidebar
+    tmux bind-key -T prefix F5 select-pane -t "$pane_sidebar"
+
+    # ── Layout proportions ──
+    # Force correct proportions (sidebar 20%, each agent column 40%)
+    # and re-apply on every terminal resize so proportions survive
+    tmux resize-pane -t "$pane_sidebar" -x "20%"
+    tmux resize-pane -t "$pane_a1" -x "40%"
+    tmux resize-pane -t "$pane_a3" -x "40%"
+    tmux set-hook -t "$SESSION" client-resized \
+        "resize-pane -t $pane_sidebar -x 20% ; resize-pane -t $pane_a1 -x 40% ; resize-pane -t $pane_a3 -x 40%"
+
+    # ── Start sidebar display ──
+
+    # AC_USAGE is passed explicitly: the pane's shell gets the tmux server's environment,
+    # which misses a one-off `AC_USAGE=claude agent-cockpit`
+    local usage_env=""
+    if [ -n "${AC_USAGE:-}" ]; then
+        usage_env="AC_USAGE=${AC_USAGE//[^a-z,]/} "
+    fi
+    tmux send-keys -t "$pane_sidebar" "${usage_env}agent-cockpit-sidebar $SESSION" Enter
+
+    # ── Focus agent 1, switch to main window, attach ──
+
+    tmux select-window -t "$SESSION:0"
+    tmux select-pane -t "$pane_a1"
+
+    # Dim inactive panes so the focused agent stands out (opt-in via --focus)
+    # Applied just before attach so styles render correctly on the connected terminal
+    if [ "$FOCUS" = true ]; then
+        apply_focus_styles
+    fi
+
+    exec tmux attach-session -t "$SESSION"
+}
+
+# ── Parse args ──
+
+# Extract --focus flag from anywhere in the args
+args=()
+for arg in "$@"; do
+    if [ "$arg" = "--focus" ]; then
+        FOCUS=true
+    else
+        args+=("$arg")
+    fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+case "${1:-}" in
+    list)
+        list_sessions
+        ;;
+    kill)
+        resolve_session "${2:-}"
+        kill_session
+        ;;
+    prune)
+        prune_sessions
+        ;;
+    attach)
+        resolve_session "${2:-}"
+        attach_session
+        ;;
+    --help|-h)
+        usage
+        ;;
+    "")
+        resolve_session ""
+        create_session
+        ;;
+    *)
+        resolve_session "$1"
+        create_session
+        ;;
+esac

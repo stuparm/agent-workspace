@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# wt-core — Git worktree manager with IntelliJ/GoLand IDE integration
+# This script is meant to be called by the shell function wrapper (shell/wt.sh),
+# not invoked directly for the "create" subcommand (since cd must happen in the parent shell).
+
+usage() {
+  cat <<'EOF'
+wt — Git Worktree Manager
+
+Usage:
+  wt <name> [--town] [--copy]  Create worktree (or switch to existing) and cd into it
+  wt list            List all worktrees in a formatted table
+  wt prune           Interactively delete worktrees via fzf
+  wt --help, -h      Show this help
+
+Create:
+  Creates a git worktree under <repo>-wt/<name> with full IntelliJ/GoLand
+  IDE integration: copies .idea config, symlinks env/config files, copies
+  .run configs with path substitution, and runs `mise trust`.
+
+  If the worktree already exists, just switches to it.
+
+  --town    Use git-town to create the branch with parent tracking:
+            - On main/master: runs `git town hack <name>` (feature off main)
+            - On other branches: runs `git town append <name>` (stacked branch)
+
+  --copy    Copy all gitignored files instead of symlinking a predefined list.
+            Useful when worktrees need independent copies of config/env files.
+
+List:
+  Displays all worktrees with branch, path, and commit hash.
+
+Prune:
+  Opens fzf for multi-select deletion of worktrees (skips main worktree).
+  Requires: fzf
+EOF
+}
+
+# ── git-town helper ──────────────────────────────────────────────────────
+
+_create_branch_with_town() {
+  local branch_name="$1"
+
+  if ! command -v git-town &>/dev/null; then
+    echo "ERROR: git-town is not installed. Install it or omit --town." >&2
+    return 1
+  fi
+
+  # Detect main branch: git-town.toml → git config → fallback
+  local main_branch="" repo_root
+  repo_root=$(git rev-parse --show-toplevel)
+  if [[ -f "$repo_root/git-town.toml" ]]; then
+    main_branch=$(grep -E '^\s*main\s*=' "$repo_root/git-town.toml" | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+  fi
+  if [[ -z "$main_branch" ]]; then
+    main_branch=$(git config git-town.main-branch 2>/dev/null) || true
+  fi
+  if [[ -z "$main_branch" ]]; then
+    if git show-ref --verify --quiet refs/heads/main; then
+      main_branch="main"
+    elif git show-ref --verify --quiet refs/heads/master; then
+      main_branch="master"
+    else
+      echo "ERROR: cannot detect main branch. Run: git town config setup" >&2
+      return 1
+    fi
+  fi
+
+  local original_branch
+  original_branch=$(git symbolic-ref --short HEAD) || {
+    echo "ERROR: detached HEAD — cannot use --town." >&2
+    return 1
+  }
+
+  if [[ "$original_branch" == "$main_branch" ]]; then
+    echo "git town hack $branch_name (feature off $main_branch)" >&2
+    git town hack "$branch_name" >&2 || return 1
+  else
+    echo "git town append $branch_name (stacked on $original_branch)" >&2
+    git town append "$branch_name" >&2 || return 1
+  fi
+
+  # Switch back — git town left us on the new branch
+  git checkout "$original_branch" >&2 || return 1
+}
+
+# ── create ──────────────────────────────────────────────────────────────────
+
+cmd_create() {
+  local NAME=""
+  local USE_TOWN=false
+  local USE_COPY=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --town) USE_TOWN=true ;;
+      --copy) USE_COPY=true ;;
+      -*)     echo "ERROR: unknown flag: $1" >&2; return 1 ;;
+      *)
+        [[ -n "$NAME" ]] && { echo "ERROR: unexpected argument: $1" >&2; return 1; }
+        NAME="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -z "$NAME" ]] && { echo "ERROR: branch name required" >&2; return 1; }
+
+  local REPO_ROOT
+  REPO_ROOT=$(git rev-parse --show-toplevel) || return 1
+
+  local REPO_PARENT
+  REPO_PARENT="$(dirname "$REPO_ROOT")"
+
+  local WT_BASE
+  WT_BASE="$REPO_PARENT/$(basename "$REPO_ROOT")-wt"
+
+  local WT_DIR
+  WT_DIR="$WT_BASE/$NAME"
+
+  mkdir -p "$WT_BASE" || return 1
+
+  # detect "main" IntelliJ module name (from main repo .idea/*.iml)
+  local MAIN_IDEA MAIN_IML MAIN_MODULE
+  MAIN_IDEA="$REPO_ROOT/.idea"
+  MAIN_IML="$(ls "$MAIN_IDEA"/*.iml 2>/dev/null | head -n 1)"
+  if [ -z "$MAIN_IML" ]; then
+    echo "ERROR: can't find main IntelliJ module (*.iml) under $MAIN_IDEA" >&2
+    echo "Open the main repo in GoLand once so it generates .idea/*.iml." >&2
+    return 1
+  fi
+  MAIN_MODULE="$(basename "$MAIN_IML" .iml)"
+
+  if [ ! -d "$WT_DIR" ]; then
+    # create worktree — existing branch → checkout, --town → git-town, new → -b
+    if git show-ref --verify --quiet "refs/heads/$NAME"; then
+      git worktree add "$WT_DIR" "$NAME" >&2 || return 1
+    elif [[ "$USE_TOWN" == true ]]; then
+      _create_branch_with_town "$NAME" || return 1
+      git worktree add "$WT_DIR" "$NAME" >&2 || return 1
+    else
+      git worktree add "$WT_DIR" -b "$NAME" >&2 || return 1
+    fi
+
+    # Force identical IntelliJ module model in the worktree
+    mkdir -p "$WT_DIR/.idea" || return 1
+
+    # Copy the module file with the SAME name as main (so module name stays stable)
+    cp -f "$MAIN_IML" "$WT_DIR/.idea/$MAIN_MODULE.iml"
+
+    # Copy modules.xml if exists; otherwise create a minimal one
+    if [ -f "$MAIN_IDEA/modules.xml" ]; then
+      cp -f "$MAIN_IDEA/modules.xml" "$WT_DIR/.idea/modules.xml"
+    else
+      cat > "$WT_DIR/.idea/modules.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://\$PROJECT_DIR\$/.idea/$MAIN_MODULE.iml" filepath="\$PROJECT_DIR\$/.idea/$MAIN_MODULE.iml" />
+    </modules>
+  </component>
+</project>
+EOF
+    fi
+
+    # VCS mapping
+    [ -f "$MAIN_IDEA/vcs.xml" ] && cp -f "$MAIN_IDEA/vcs.xml" "$WT_DIR/.idea/vcs.xml"
+
+    # Seed workspace.xml so GoLand opens the worktree correctly:
+    #   - VgoProject/integration-enabled=true  → Go modules integration ON.
+    #     Without it GoLand re-runs its modules-settings migration and defaults
+    #     integration to false, redding out every import until manually enabled.
+    #   - settings-migrated=true               → don't re-run that migration.
+    #   - GOROOT (copied from main)            → pin the same toolchain as mise.toml.
+    local GOROOT_LINE=""
+    if [ -f "$MAIN_IDEA/workspace.xml" ]; then
+      GOROOT_LINE=$(grep -E '<component name="GOROOT"' "$MAIN_IDEA/workspace.xml" | head -1)
+    fi
+    cat > "$WT_DIR/.idea/workspace.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  ${GOROOT_LINE}
+  <component name="VgoProject">
+    <integration-enabled>true</integration-enabled>
+    <settings-migrated>true</settings-migrated>
+  </component>
+</project>
+EOF
+
+    # Project display name (e.g. "my-project-123-refactor")
+    echo "$(basename "$REPO_ROOT")-$NAME" > "$WT_DIR/.idea/.name"
+
+    if [[ "$USE_COPY" == true ]]; then
+      # Copy all gitignored files (except .idea/ and .run/, handled separately)
+      local copied=0
+      while IFS= read -r f; do
+        case "$f" in
+          .idea/*|.run/*) continue ;;
+        esac
+        local dir
+        dir=$(dirname "$f")
+        [[ "$dir" != "." ]] && mkdir -p "$WT_DIR/$dir"
+        cp -a "$REPO_ROOT/$f" "$WT_DIR/$f"
+        copied=$((copied + 1))
+      done < <(cd "$REPO_ROOT" && git ls-files --others --ignored --exclude-standard)
+      echo "Copied $copied gitignored files" >&2
+    else
+      # Read symlink config from .env (falls back to .env.example)
+      local SCRIPT_DIR
+      SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      local WT_SYMLINK_FILES="" WT_SYMLINK_PATTERNS=""
+
+      if [[ -f "$SCRIPT_DIR/../.env" ]]; then
+        source "$SCRIPT_DIR/../.env"
+      elif [[ -f "$SCRIPT_DIR/../.env.example" ]]; then
+        echo "WARN: no .env found — using .env.example defaults" >&2
+        echo "  To customize: cp $SCRIPT_DIR/../.env.example $SCRIPT_DIR/../.env" >&2
+        source "$SCRIPT_DIR/../.env.example"
+      else
+        echo "WARN: no .env or .env.example found, skipping symlinks" >&2
+      fi
+
+      # Symlink individual config files
+      local f
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        [ -f "$REPO_ROOT/$f" ] && ln -sf "$REPO_ROOT/$f" "$WT_DIR/$f"
+      done <<< "$WT_SYMLINK_FILES"
+
+      # Symlink config template files (recursive, preserving directory structure)
+      local pattern
+      while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        (cd "$REPO_ROOT" && find . -name "$pattern" -not -path "./.git/*") | while read -r f; do
+          local dir
+          dir=$(dirname "$f")
+          mkdir -p "$WT_DIR/$dir"
+          ln -sf "$REPO_ROOT/$f" "$WT_DIR/$f"
+        done
+      done <<< "$WT_SYMLINK_PATTERNS"
+    fi
+
+    # Copy .run configs with path substitution
+    if [ -d "$REPO_ROOT/.run" ]; then
+      mkdir -p "$WT_DIR/.run"
+      for f in "$REPO_ROOT/.run"/*.xml; do
+        [ -f "$f" ] || continue
+        sed \
+          -e "s|$REPO_ROOT|$WT_DIR|g" \
+          -e "s|<module name=\"[^\"]\+\" */>|<module name=\"$MAIN_MODULE\" />|g" \
+          "$f" > "$WT_DIR/.run/$(basename "$f")"
+      done
+    fi
+
+    echo "Worktree created: $WT_DIR (module forced to: $MAIN_MODULE)" >&2
+
+    # trust mise.toml in the new worktree
+    (cd "$WT_DIR" && mise trust) >&2 || return 1
+  fi
+
+  # Print the worktree path to stdout (captured by shell wrapper for cd)
+  echo "$WT_DIR"
+}
+
+# ── list ────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+  git rev-parse --show-toplevel > /dev/null 2>&1 || {
+    echo "ERROR: not inside a git repository" >&2
+    return 1
+  }
+
+  # Parse porcelain output
+  local branch path commit
+  local -a branches=() paths=() commits=()
+
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        path="${line#worktree }"
+        ;;
+      "HEAD "*)
+        commit="${line#HEAD }"
+        commit="${commit:0:7}"
+        ;;
+      "branch "*)
+        branch="${line#branch refs/heads/}"
+        ;;
+      "detached")
+        branch="(detached)"
+        ;;
+      "")
+        if [ -n "${path:-}" ]; then
+          branches+=("${branch:-bare}")
+          paths+=("$path")
+          commits+=("${commit:-}")
+        fi
+        branch="" path="" commit=""
+        ;;
+    esac
+  done < <(git worktree list --porcelain; echo "")
+
+  if [ ${#paths[@]} -eq 0 ]; then
+    echo "No worktrees found."
+    return 0
+  fi
+
+  # Calculate column widths
+  local max_branch=6 max_path=4
+  local i
+  for i in "${!branches[@]}"; do
+    (( ${#branches[$i]} > max_branch )) && max_branch=${#branches[$i]}
+    (( ${#paths[$i]} > max_path )) && max_path=${#paths[$i]}
+  done
+
+  # Print table
+  printf "%-${max_branch}s  %-${max_path}s  %s\n" "BRANCH" "PATH" "COMMIT"
+  for i in "${!branches[@]}"; do
+    printf "%-${max_branch}s  %-${max_path}s  %s\n" "${branches[$i]}" "${paths[$i]}" "${commits[$i]}"
+  done
+}
+
+# ── prune ───────────────────────────────────────────────────────────────────
+
+cmd_prune() {
+  git rev-parse --show-toplevel > /dev/null 2>&1 || {
+    echo "ERROR: not inside a git repository" >&2
+    return 1
+  }
+
+  if ! command -v fzf &> /dev/null; then
+    echo "ERROR: fzf is required for interactive pruning." >&2
+    echo "Install: brew install fzf  (macOS) or apt install fzf  (Linux)" >&2
+    return 1
+  fi
+
+  # Get worktrees, skip the first one (main worktree)
+  local worktrees
+  worktrees=$(git worktree list | tail -n +2)
+
+  if [ -z "$worktrees" ]; then
+    echo "No additional worktrees to prune."
+    return 0
+  fi
+
+  # Present via fzf with multi-select
+  local selected
+  selected=$(echo "$worktrees" | fzf --multi --header="TAB to toggle, ENTER to confirm deletion") || {
+    echo "No worktrees selected."
+    return 0
+  }
+
+  # Show what will be deleted
+  echo "Will delete the following worktrees:"
+  echo "$selected"
+  echo ""
+
+  # Confirm
+  printf "Proceed? [y/N] "
+  read -r confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    return 0
+  fi
+
+  # Delete each selected worktree
+  while IFS= read -r line; do
+    local wt_path
+    wt_path=$(echo "$line" | awk '{print $1}')
+    echo "Removing: $wt_path"
+    git worktree remove "$wt_path" --force || echo "WARNING: failed to remove $wt_path" >&2
+  done <<< "$selected"
+
+  echo "Done."
+}
+
+# ── main dispatch ───────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  create)
+    shift
+    [[ $# -eq 0 ]] && { echo "usage: wt-core create <name> [--town] [--copy]" >&2; exit 1; }
+    cmd_create "$@"
+    ;;
+  list)
+    cmd_list
+    ;;
+  prune)
+    cmd_prune
+    ;;
+  --help|-h|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    echo "Run 'wt --help' for usage." >&2
+    exit 1
+    ;;
+esac

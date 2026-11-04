@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Codex usage producer for the cockpit sidebar. Codex has no statusLine hook, but every
+# session log (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) records rate_limits on its
+# token_count events. This reads the newest one and hands its windows to
+# agent-cockpit-usage-write. Run by the sidebar in the background, at most every 30s.
+
+SESSIONS_DIR="${CODEX_HOME:-$HOME/.codex}/sessions"
+[[ -d "$SESSIONS_DIR" ]] || exit 0
+command -v jq >/dev/null || exit 0
+
+# Newest session first; a session that just started may not have reported limits yet
+line=""
+while IFS= read -r file; do
+    line=$(grep -F '"rate_limits":{' "$file" 2>/dev/null | tail -n 1)
+    [[ -n "$line" ]] && break
+done < <(find "$SESSIONS_DIR" -type f -name 'rollout-*.jsonl' -mtime -7 -exec ls -t {} + 2>/dev/null)
+[[ -n "$line" ]] || exit 0
+
+# Window labels from their length: 300 → 5h, 10080 → week, 43200 → 30d
+rows=$(jq -r '
+    def window_label($m):
+        if $m == 10080 then "week"
+        elif $m % 10080 == 0 then "\($m / 10080)w"
+        elif $m % 1440 == 0 then "\($m / 1440)d"
+        elif $m % 60 == 0 then "\($m / 60)h"
+        else "\($m)m" end;
+    ((.timestamp // "") | sub("\\.[0-9]+"; "") | try fromdateiso8601 catch null) as $ts
+    | .payload.rate_limits
+    | (.primary, .secondary)
+    | select(. != null and .used_percent != null and .window_minutes != null)
+    | (.resets_at // (if $ts and .resets_in_seconds then $ts + .resets_in_seconds else null end)) as $reset
+    | select($reset != null)
+    | [window_label(.window_minutes), (.used_percent | round), ($reset | floor), ($ts // now | floor)]
+    | @tsv' <<<"$line" 2>/dev/null)
+[[ -n "$rows" ]] || exit 0
+
+writer="${0%/*}/agent-cockpit-usage-write"
+[[ -x "$writer" ]] || writer=agent-cockpit-usage-write
+"$writer" codex <<<"$rows"

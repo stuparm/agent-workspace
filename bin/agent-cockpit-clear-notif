@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Called by tmux pane-focus-in hook. Clears notification for the focused pane's slot.
+# Usage: agent-cockpit-clear-notif SESSION PANE_ID
+
+SESSION="${1:?Usage: agent-cockpit-clear-notif SESSION PANE_ID}"
+PANE_ID="${2:?Usage: agent-cockpit-clear-notif SESSION PANE_ID}"
+STATE_DIR="/tmp/${SESSION}"
+
+for i in 1 2 3 4; do
+    agent_pane=$(tmux show-environment -t "$SESSION" "AGENT_PANE_$i" 2>/dev/null | cut -d= -f2) || continue
+
+    if [[ "$PANE_ID" == "$agent_pane" ]]; then
+        notif_file="$STATE_DIR/notif$i"
+        if [[ -s "$notif_file" ]]; then
+            : > "$notif_file"
+            : > "$STATE_DIR/notif_msg$i"
+            printf '.\n' >> "$STATE_DIR/notify"
+        fi
+        exit 0
+    fi
+done
+
+# Pane is sidebar or unrecognized — exit silently
+exit 0
