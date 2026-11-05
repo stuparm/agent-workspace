@@ -138,7 +138,7 @@ cmd_init() {
     return 1
   fi
 
-  mkdir -p "$target"/{memory,wiki,meetings,inbox,raw,.locks}
+  mkdir -p "$target"/{memory,wiki,meetings,inbox,raw,decisions,sessions,.locks}
   : > "$target/log.md"
   : > "$target/index.md"
 
@@ -165,7 +165,7 @@ EOF
   cat > "$target/CLAUDE.md" <<'EOF'
 # Knowledge Base — Schema for Agents
 
-Personal "second brain" — plain markdown, local git only, no remote.
+Personal "second brain" — plain markdown in git. A remote is optional (`kb sync` needs one).
 
 ## Layout
 
@@ -173,6 +173,9 @@ Personal "second brain" — plain markdown, local git only, no remote.
 - `memory/` — typed entries (user / feedback / project / reference). One file each.
 - `wiki/` — topic pages: architecture, packages, debugging recipes, conventions.
 - `meetings/` — meeting minutes. `YYYY-MM-DD-<topic>.md`.
+- `decisions/` — decision records (ADR-lite). `YYYY-MM-DD-<slug>.md`.
+- `sessions/` — session digests. `YYYY-MM-DD-<repo>-<slug>.md`; `kb sessions prune` moves old
+  ones to `sessions-archive/`.
 - `inbox/` — staging area for ad-hoc captures. `<session>-<ts>-<slug>.md`.
 - `raw/` — sources (articles, transcripts, screenshots). Read; do not modify.
 - `log.md` — append-only chronological event log.
@@ -185,7 +188,9 @@ Personal "second brain" — plain markdown, local git only, no remote.
 3. User prefs / project context / references: `kb memory add <type> <name>`.
 4. Meetings: `kb meeting <topic>`.
 5. Notable events: `kb log <kind> <title>`.
-6. Periodic triage: `kb inbox process` (manual) + `kb lint` (regenerates index).
+6. Choices worth remembering: `kb decision <slug>`. Session summaries: `kb digest <slug>`.
+7. Periodic triage: `kb inbox` lists captures to move into `wiki/` or `memory/` by hand;
+   `kb lint` regenerates the index.
 
 ## Concurrency rules
 
@@ -200,7 +205,7 @@ Up to 4 parallel Claude sessions may write here.
 
 - Don't restate facts already in the source repo — link instead.
 - Don't write narrative prose. Be terse, structured, scannable.
-- Don't add a git remote.
+- Don't push the KB to a public remote — it holds private notes.
 EOF
 
   cat > "$target/.gitignore" <<'EOF'
@@ -208,6 +213,7 @@ EOF
 .locks/
 inbox/*
 !inbox/.gitkeep
+.session-queue.jsonl
 EOF
   touch "$target/inbox/.gitkeep"
 
@@ -568,7 +574,9 @@ cmd_sessions() {
     prune)
       local days="${1:-14}"
       local live="$kb/sessions" arch="$kb/sessions-archive"
-      local cutoff; cutoff=$(date -v-"${days}"d +%Y-%m-%d) || return 1
+      # BSD date (macOS) first, then GNU date (Linux).
+      local cutoff
+      cutoff=$(date -v-"${days}"d +%Y-%m-%d 2>/dev/null || date -d "-${days} days" +%Y-%m-%d) || return 1
       mkdir -p "$arch"
       local moved=0 f base d
       for f in "$live"/*.md; do

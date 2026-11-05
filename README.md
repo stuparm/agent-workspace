@@ -130,6 +130,7 @@ wt prune           # Interactive deletion via fzf
 - **jq** — `brew install jq` / `apt install jq`; required by `install.sh` and the usage block
 - **fzf** — required for `prune` commands
 - **zsh** — `shell/init.sh` is zsh-only
+- **python3** — only for `kb queue bump`
 
 ### Setup
 

@@ -55,6 +55,12 @@ kb sync                       pull --rebase, commit all, push to origin
 kb lint                       Regenerate index.md from wiki/, meetings/, memory/, decisions/
 ```
 
+`kb queue` is only the storage half of automatic session digests. The producer is meant to be a
+Claude Code `SessionEnd` (and `PreCompact`) hook that reads `session_id`, `transcript_path` and `cwd`
+from its stdin JSON and runs `kb queue add`; the consumer is a scheduled job that summarizes each queued
+transcript (e.g. with `claude -p`) and then runs `kb queue remove` (or `kb queue bump` on failure).
+Neither ships in this repo. `kb sessions prune` is what such a job runs to keep `sessions/` short.
+
 Session identification (used in inbox filenames): `$TMUX_PANE` if inside tmux, else `$(hostname -s)-$$`.
 
 Locking: mkdir-based (POSIX atomic). No `flock` dependency.
